@@ -1,0 +1,135 @@
+name: upstream-alert
+
+# 每 30 分钟检查一次上游健康计数；发现断供时以 github-actions[bot] 身份开 issue。
+# 用 bot 而不是个人 PAT 的原因：GitHub 不会给「你自己创建的内容」发通知邮件，
+# 只有别的 actor 创建才会推送到 Default notifications email。
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      status_url:
+        description: "覆盖 /api/v1/status 地址（默认用仓库变量或生产地址）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch status
+        id: fetch
+        env:
+          STATUS_URL: ${{ github.event.inputs.status_url || vars.STATUS_URL || 'https://cleanbus.277011444.workers.dev/api/v1/status' }}
+        run: |
+          set -u
+          code=$(curl -sS -o status.json -w "%{http_code}" --max-time 25 "$STATUS_URL" || echo "000")
+          echo "url=$STATUS_URL http=$code"
+          head -c 800 status.json || true
+          echo
+          if [ "$code" = "200" ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate thresholds
+        id: evaluate
+        if: steps.fetch.outputs.ok == '1'
+        env:
+          ALERT_THRESHOLD: ${{ vars.ALERT_THRESHOLD || '3' }}
+        run: |
+          python3 - "$ALERT_THRESHOLD" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          threshold = int(sys.argv[1])
+          data = json.load(open("status.json"))
+          fired = []
+          for name, src in (data.get("sources") or {}).items():
+              health = (src or {}).get("health") or {}
+              count = int(health.get("count") or 0)
+              if count >= threshold:
+                  fired.append({
+                      "source": name,
+                      "count": count,
+                      "lastKind": health.get("lastKind") or "-",
+                      "lastAt": health.get("lastAt") or "-",
+                  })
+          print("alerts=" + json.dumps(fired))
+          print("count=" + str(len(fired)))
+          PY
+
+      - name: Ensure label exists
+        if: steps.fetch.outputs.ok == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh label create ops-alert --color FBCA04 --description "上游断供告警" 2>/dev/null || true
+
+      - name: Open issues (dedupe by open ops-alert issue)
+        if: steps.fetch.outputs.ok == '1' && steps.evaluate.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALERTS: ${{ steps.evaluate.outputs.alerts }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, subprocess
+
+          NAMES = {"chelaile": "车来了", "mygolbs": "掌上公交"}
+          ROTATION = """### 处理（约 30 秒，无需发版）
+          ```bash
+          curl -X POST https://cleanbus.277011444.workers.dev/api/v1/admin/rules \\
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \\
+            -d '{"chelaile":{"version":<当前版本+1>,"baseUrl":"https://web.chelaile.net.cn/api","salt":"<新salt>","aesKey":"<新key>"}}'
+          ```
+          处理后访问 `GET /api/v1/status` 确认 `health.count` 停止增长。"""
+
+          alerts = json.loads(os.environ.get("ALERTS") or "[]")
+          open_issues = json.loads(subprocess.run(
+              ["gh", "issue", "list", "--label", "ops-alert", "--state", "open",
+               "--json", "number,title", "--limit", "50"],
+              capture_output=True, text=True, check=True).stdout or "[]")
+
+          for a in alerts:
+              src = a["source"]
+              cn = NAMES.get(src, src)
+              if any(cn in (i.get("title") or "") for i in open_issues):
+                  print(f"skip {src}: 已有未关闭的告警 issue")
+                  continue
+              title = f"[告警] {cn} 上游疑似断供（累计 {a['count']} 次失败）"
+              body = "\n".join([
+                  f"自动巡检发现 `{src}` 的客户端失败计数达到 {a['count']}，超过阈值。",
+                  "",
+                  "| 字段 | 值 |",
+                  "|---|---|",
+                  f"| 源 | `{src}` |",
+                  f"| 累计失败 | {a['count']} |",
+                  f"| 最后失败类型 | `{a['lastKind']}` |",
+                  f"| 最后失败时间 | {a['lastAt']} |",
+                  "",
+                  ROTATION if src == "chelaile" else "掌上公交通常会在 30 分钟内自动嗅探自愈；若持续 2 小时未恢复，检查 Worker 日志与上游 bundle 结构。",
+                  "",
+                  "_由 `.github/workflows/alert.yml` 自动创建；同源存在未关闭告警时不会重复开。_",
+              ])
+              subprocess.run(["gh", "issue", "create",
+                              "--title", title, "--body", body,
+                              "--label", "ops-alert"], check=True)
+              print(f"created issue for {src}: {title}")
+          PY
+
+      - name: Note on existing issues when recovered
+        if: steps.fetch.outputs.ok == '1' && steps.evaluate.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          nums=$(gh issue list --label ops-alert --state open --json number --jq '.[].number' --limit 20 || true)
+          for n in $nums; do
+            gh issue comment "$n" --body "本轮巡检未发现超过阈值的失败计数，若已恢复可关闭本 issue。"
+          done
+
