@@ -80,6 +80,42 @@ async function saveRules(env, newRules) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// 上游健康上报（客户端侧静默失败转成可观测信号）
+// 存储：KV health:<source> -> { count, lastAt, lastKind, lastVersion }
+// 限流：KV health_rl:<ip>    -> 60s 一条，防刷
+// ---------------------------------------------------------------------------
+const HEALTH_SOURCES = new Set(["chelaile", "mygolbs"]);
+const HEALTH_KINDS = new Set(["decrypt-fail", "parse-fail", "empty", "http-error", "timeout"]);
+
+async function recordHealth(env, source, kind, clientVersion) {
+  if (!env || !env.RULES_KV) return null;
+  const key = "health:" + source;
+  let cur = null;
+  try {
+    cur = await env.RULES_KV.get(key, "json");
+  } catch (e) {
+    cur = null;
+  }
+  const next = {
+    count: (cur && Number.isFinite(cur.count) ? cur.count : 0) + 1,
+    lastAt: new Date().toISOString(),
+    lastKind: kind,
+    lastVersion: clientVersion || (cur && cur.lastVersion) || ""
+  };
+  await env.RULES_KV.put(key, JSON.stringify(next));
+  return next;
+}
+
+async function readHealth(env, source) {
+  if (!env || !env.RULES_KV) return null;
+  try {
+    return await env.RULES_KV.get("health:" + source, "json");
+  } catch (e) {
+    return null;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -124,6 +160,97 @@ export default {
         }, 200, {
           'Cache-Control': 'public, max-age=300'
         });
+      }
+
+      // 客户端上游健康上报：POST，无需鉴权但按 IP 限流 1 条/分钟
+      if (pathname === '/api/v1/report') {
+        if (request.method !== 'POST') {
+          return jsonResponse({ error: 'Method Not Allowed: POST required', code: 405 }, 405, { 'Allow': 'POST' });
+        }
+
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+        const rlKey = 'health_rl:' + ip;
+        // 注意：return 必须放在 try 外面。204 不能带 body，若在 try 内构造响应抛错，
+        // 会被下面的 KV 异常兜底吞掉，导致限流静默失效。
+        let throttled = false;
+        if (env && env.RULES_KV) {
+          try {
+            const last = await env.RULES_KV.get(rlKey);
+            if (last && Date.now() - parseInt(last, 10) < 60 * 1000) {
+              throttled = true;
+            } else {
+              await env.RULES_KV.put(rlKey, Date.now().toString(), { expirationTtl: 120 });
+            }
+          } catch (e) {}
+        }
+        if (throttled) {
+          return new Response(null, {
+            status: 204,
+            headers: {
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-store'
+            }
+          });
+        }
+
+        let body = null;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return jsonResponse({ error: 'Invalid JSON body', code: 400 }, 400);
+        }
+
+        const source = String((body && body.source) || '');
+        const kind = String((body && body.kind) || '');
+        if (!HEALTH_SOURCES.has(source) || !HEALTH_KINDS.has(kind)) {
+          return jsonResponse({ error: 'Invalid source or kind', code: 400 }, 400);
+        }
+        const clientVersion = String((body && body.version) || '').slice(0, 24);
+
+        const health = await recordHealth(env, source, kind, clientVersion);
+        return jsonResponse({ ok: true, recorded: health != null }, 200, { 'Cache-Control': 'no-store' });
+      }
+
+      // 运维视图：一眼看出两个上游各自是否还活着
+      if (pathname === '/api/v1/status') {
+        const rules = await getRules(env);
+        const [chelaileHealth, mygolbsHealth] = await Promise.all([
+          readHealth(env, 'chelaile'),
+          readHealth(env, 'mygolbs')
+        ]);
+        return jsonResponse({
+          ok: true,
+          ruleVersion: rules.ruleVersion,
+          keyVerified: rules.keyVerified === true,
+          lastSniffStatus: rules.lastSniffStatus || null,
+          lastSniffTime: rules.lastSniffTime || null,
+          sources: {
+            chelaile: {
+              version: rules.chelaile && rules.chelaile.version,
+              host: rules.chelaile && rules.chelaile.baseUrl,
+              keyVerified: rules.chelaile && rules.chelaile.keyVerified === true,
+              health: chelaileHealth
+            },
+            mygolbs: {
+              version: rules.mygolbs && rules.mygolbs.version,
+              host: rules.mygolbs && rules.mygolbs.url,
+              keyVerified: rules.mygolbs && rules.mygolbs.keyVerified === true,
+              health: mygolbsHealth
+            }
+          }
+        }, 200, { 'Cache-Control': 'no-store' });
+      }
+
+      // 手动触发一次断供检查（演练 / 验证告警链路用）
+      if (pathname === '/api/v1/triggerAlert') {
+        if (request.method !== 'POST') {
+          return jsonResponse({ error: 'Method Not Allowed: POST required', code: 405 }, 405, { 'Allow': 'POST' });
+        }
+        if (!env || !env.ADMIN_TOKEN || !verifyBearerToken(request, env.ADMIN_TOKEN)) {
+          return jsonResponse({ error: 'Unauthorized: valid Bearer token required', code: 401 }, 401);
+        }
+        const r = await checkAndAlert(env);
+        return jsonResponse(r, 200, { 'Cache-Control': 'no-store' });
       }
 
       // 嗅探测试端点：鉴权 + POST 限流
@@ -329,9 +456,118 @@ export default {
   // 每 30 分钟由 Cloudflare 自动唤醒执行
   async scheduled(event, env, ctx) {
     console.log("30-min Cron auto-sniff trigger started at:", new Date().toISOString());
-    ctx.waitUntil(autoSniffAndSelfHeal(env));
+    ctx.waitUntil((async () => {
+      try {
+        await autoSniffAndSelfHeal(env);
+      } catch (e) {
+        console.error("sniff failed:", e && e.message);
+      }
+      try {
+        await checkAndAlert(env);
+      } catch (e) {
+        console.error("alert failed:", e && e.message);
+      }
+    })());
   }
 };
+
+// ---------------------------------------------------------------------------
+// 断供告警：把 /api/v1/status 里的失败计数变成 GitHub Issue（GitHub 会推邮件）
+// 依赖 secret：GH_ALERT_TOKEN（repo scope）、GH_REPO（owner/name）
+// 去重：同一源 6 小时内最多一条 issue
+// ---------------------------------------------------------------------------
+const ALERT_DEDUPE_MS = 6 * 60 * 60 * 1000;
+
+async function checkAndAlert(env) {
+  if (!env || !env.GH_ALERT_TOKEN || !env.GH_REPO || !env.RULES_KV) {
+    return { skipped: "GH_ALERT_TOKEN / GH_REPO / RULES_KV 未配置" };
+  }
+  const threshold = Number(env.ALERT_THRESHOLD || 5);
+  const fired = [];
+
+  for (const source of ["chelaile", "mygolbs"]) {
+    const health = await readHealth(env, source);
+    if (!health) continue;
+
+    const stateKey = "alert_state:" + source;
+    let prev = null;
+    try {
+      prev = await env.RULES_KV.get(stateKey, "json");
+    } catch (e) {
+      prev = null;
+    }
+
+    const lastCount = prev && Number.isFinite(prev.count) ? prev.count : 0;
+    const delta = health.count - lastCount;
+    const lastAlertAt = prev && prev.alertedAt ? Date.parse(prev.alertedAt) : 0;
+    const cooled = !lastAlertAt || Date.now() - lastAlertAt > ALERT_DEDUPE_MS;
+
+    if (!prev) {
+      // 建立基线，避免首次部署就误报历史累计
+      await env.RULES_KV.put(stateKey, JSON.stringify({ count: health.count, alertedAt: null }));
+      continue;
+    }
+
+    if (delta >= threshold && cooled) {
+      const ok = await createAlertIssue(env, source, delta, health);
+      if (ok) {
+        fired.push({ source, delta });
+        await env.RULES_KV.put(stateKey, JSON.stringify({ count: health.count, alertedAt: new Date().toISOString() }));
+      }
+    } else if (delta > 0) {
+      // 继续累计，保留上次告警时间
+      await env.RULES_KV.put(stateKey, JSON.stringify({ count: health.count, alertedAt: prev.alertedAt || null }));
+    }
+  }
+
+  return { alerts: fired.length, fired };
+}
+
+async function createAlertIssue(env, source, delta, health) {
+  const isChelaile = source === "chelaile";
+  const title = isChelaile
+    ? `[CleanBus] 车来了疑似断供（10 分钟内新增 ${delta} 次失败）`
+    : `[CleanBus] 掌上公交疑似断供（10 分钟内新增 ${delta} 次失败）`;
+  const body = [
+    `自动告警：\`${source}\` 客户端失败计数在监控窗口内增加 ${delta} 次。`,
+    "",
+    "| 字段 | 值 |",
+    "|---|---|",
+    `| 源 | \`${source}\` |`,
+    `| 最后失败类型 | \`${health.lastKind || "-"}\` |`,
+    `| 最后失败时间 | ${health.lastAt || "-"} |`,
+    `| 累计失败 | ${health.count} |`,
+    "",
+    isChelaile
+      ? "### 处理（约 30 秒）\n```bash\ncurl -X POST https://cleanbus.277011444.workers.dev/api/v1/admin/rules \\\n  -H \"Authorization: Bearer $ADMIN_TOKEN\" -H \"Content-Type: application/json\" \\\n  -d '{\"chelaile\":{\"version\":<当前+1>,\"baseUrl\":\"https://web.chelaile.net.cn/api\",\"salt\":\"<新salt>\",\"aesKey\":\"<新key>\"}}'\n```"
+      : "### 处理\n掌上公交一般 30 分钟内自愈（cron 自动嗅探）。若持续超过 2 小时，检查 Worker 日志与上游 bundle 结构变化。",
+    "",
+    "处理完可执行 `GET /api/v1/status` 确认 `health.count` 停止增长。",
+    "",
+    "_本条由 CleanBus Worker cron 自动创建；同源 6 小时内不会重复。_"
+  ].join("\n");
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${env.GH_REPO}/issues`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.GH_ALERT_TOKEN}`,
+        "User-Agent": "CleanBus-Worker",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ title, body, labels: ["ops-alert"] })
+    });
+    if (!res.ok) {
+      console.error("create issue failed:", res.status, (await res.text()).slice(0, 200));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("create issue error:", e && e.message);
+    return false;
+  }
+}
 
 function verifyBearerToken(request, expectedToken) {
   if (!expectedToken || typeof expectedToken !== 'string') return false;

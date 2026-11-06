@@ -1,0 +1,41 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch android.jar (API 34)
+        run: |
+          curl -sSL -o platform.zip https://dl.google.com/android/repository/platform-34-ext7_r03.zip
+          unzip -q platform.zip 'android-34/android.jar' -d .
+          ls -lh android-34/android.jar
+
+      - name: Compile client (javac --release 11)
+        run: |
+          mkdir -p out
+          find app/src/main/java -name '*.java' > sources.txt
+          javac -encoding UTF-8 --release 11 -cp android-34/android.jar -d out @sources.txt
+          echo "compiled: $(find out -name '*.class' | wc -l) classes"
+
+      - name: Worker syntax check
+        run: |
+          cp cloud_gateway/clean_bus_worker.js /tmp/worker.mjs
+          node --check /tmp/worker.mjs
+
+      - name: Worker contract test (ECDSA sign / tamper / auth)
+        run: node tools/ci/verify_worker.mjs cloud_gateway/clean_bus_worker.js
