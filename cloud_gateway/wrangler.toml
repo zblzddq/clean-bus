@@ -7,4 +7,9 @@ crons = ["*/30 * * * *"]
 
 [[kv_namespaces]]
 binding = "RULES_KV"
-id = "RULES_KV_ID_PLACEHOLDER"
+id = "5654ac6c76a64933ac433b7bbb5aa9d9"
+
+[vars]
+GH_REPO = "zblzddq/clean-bus"
+ALERT_THRESHOLD = "5"
+
