@@ -4,6 +4,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -49,35 +50,48 @@ public class MyGoLbsSource implements IBusDataSource {
         }
         byte[] bodyBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
 
-        URL url = new URL(getApiUrl());
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setConnectTimeout(8000);
-        conn.setReadTimeout(8000);
-        conn.setDoOutput(true);
-        conn.setDoInput(true);
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(getApiUrl());
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            conn.setDoInput(true);
 
-        // 关键请求头伪装
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
-        conn.setRequestProperty("Origin", "https://h5.mygolbs.com");
-        conn.setRequestProperty("Referer", "https://h5.mygolbs.com/");
-        conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
-        conn.setRequestProperty("Accept", "application/json, text/javascript, */*; q=0.01");
+            // 关键请求头伪装
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+            conn.setRequestProperty("Origin", "https://h5.mygolbs.com");
+            conn.setRequestProperty("Referer", "https://h5.mygolbs.com/");
+            conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+            conn.setRequestProperty("Accept", "application/json, text/javascript, */*; q=0.01");
 
-        conn.getOutputStream().write(bodyBytes);
-        conn.getOutputStream().flush();
+            conn.getOutputStream().write(bodyBytes);
+            conn.getOutputStream().flush();
 
-        int code = conn.getResponseCode();
-        InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[4096];
-        int n;
-        while ((n = is.read(buf)) != -1) {
-            baos.write(buf, 0, n);
+            int code = conn.getResponseCode();
+            InputStream is = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+            if (is == null) {
+                throw new IOException("HTTP " + code + ": empty response from " + getApiUrl());
+            }
+
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (InputStream stream = is) {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = stream.read(buf)) != -1) {
+                    baos.write(buf, 0, n);
+                }
+            }
+            String resStr = baos.toString("UTF-8").trim();
+            return new JSONObject(resStr);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
-        String resStr = baos.toString("UTF-8").trim();
-        return new JSONObject(resStr);
     }
 
     private String resolveCityName(String cityId, double lat, double lng) {
@@ -212,8 +226,10 @@ public class MyGoLbsSource implements IBusDataSource {
         String startSn = "";
         String endSn = "";
         if (stList != null && stList.length() > 0) {
-            startSn = stList.optJSONObject(0).optString("stationName", "");
-            endSn = stList.optJSONObject(stList.length() - 1).optString("stationName", "");
+            JSONObject firstSt = stList.optJSONObject(0);
+            JSONObject lastSt = stList.optJSONObject(stList.length() - 1);
+            startSn = firstSt != null ? firstSt.optString("stationName", "") : "";
+            endSn = lastSt != null ? lastSt.optString("stationName", "") : "";
         }
         line.put("startSn", startSn);
         line.put("endSn", endSn);
@@ -263,7 +279,7 @@ public class MyGoLbsSource implements IBusDataSource {
         oppLine.put("lineId", lineName + "@@@" + oppDir + "@@@" + cityName);
         oppLine.put("endSn", startSn);
         otherLines.put(oppLine);
-        res.put("otherLines", otherLines);
+        res.put("otherlines", otherLines);
 
         return res;
     }

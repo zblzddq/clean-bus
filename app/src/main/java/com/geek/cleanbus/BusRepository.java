@@ -81,6 +81,7 @@ public class BusRepository {
      */
     public JSONObject getNearbyStops(double lat, double lng, String cityId) throws Exception {
         IBusDataSource primary = getSourceForCity(cityId);
+        Exception firstEx = null;
         try {
             JSONObject result = primary.getNearbyStops(lat, lng, cityId);
             if (result != null && result.has("nearSts")) {
@@ -91,6 +92,7 @@ public class BusRepository {
                 }
             }
         } catch (Exception e) {
+            firstEx = e;
             if (mSources.size() <= 1) throw e;
         }
 
@@ -109,8 +111,13 @@ public class BusRepository {
             } catch (Exception ignored) {}
         }
 
-        // 最终返回首选源结果或抛出
-        return primary.getNearbyStops(lat, lng, cityId);
+        // 全部降级失败后直接抛出首次异常，避免重复请求 primary
+        if (firstEx != null) {
+            throw firstEx;
+        }
+        JSONObject empty = new JSONObject();
+        empty.put("nearSts", new JSONArray());
+        return empty;
     }
 
     /**

@@ -37,25 +37,33 @@ public class CloudGatewaySource implements IBusDataSource {
 
     private JSONObject doGet(String endpoint) throws Exception {
         URL url = new URL(mGatewayBaseUrl + endpoint);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(1500); // 1.5s 快速超时熔断
-        conn.setReadTimeout(2000);
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(1500); // 1.5s 快速超时熔断
+            conn.setReadTimeout(2000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-        int code = conn.getResponseCode();
-        if (code != 200) {
-            throw new RuntimeException("Gateway error: " + code);
-        }
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                throw new RuntimeException("Gateway error: " + code);
+            }
 
-        InputStream is = conn.getInputStream();
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[2048];
-        int n;
-        while ((n = is.read(buf)) != -1) {
-            baos.write(buf, 0, n);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (InputStream is = conn.getInputStream()) {
+                byte[] buf = new byte[2048];
+                int n;
+                while ((n = is.read(buf)) != -1) {
+                    baos.write(buf, 0, n);
+                }
+            }
+            return new JSONObject(baos.toString("UTF-8"));
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
-        return new JSONObject(baos.toString("UTF-8"));
     }
 
     @Override

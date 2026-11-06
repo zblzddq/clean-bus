@@ -137,27 +137,35 @@ public class ChelaileApi {
         }
 
         URL url = new URL(urlBuilder.toString());
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(8000);
-        conn.setReadTimeout(10000);
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781");
-        conn.setRequestProperty("Referer", "https://servicewechat.com/wx71d589ea01ce3321/814/page-frame.html");
-        conn.setRequestProperty("xweb_xhr", "1");
-        conn.setRequestProperty("Sec-Fetch-Site", "cross-site");
-        conn.setRequestProperty("Sec-Fetch-Mode", "cors");
-        conn.setRequestProperty("Sec-Fetch-Dest", "empty");
+        HttpURLConnection conn = null;
+        String raw;
+        try {
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781");
+            conn.setRequestProperty("Referer", "https://servicewechat.com/wx71d589ea01ce3321/814/page-frame.html");
+            conn.setRequestProperty("xweb_xhr", "1");
+            conn.setRequestProperty("Sec-Fetch-Site", "cross-site");
+            conn.setRequestProperty("Sec-Fetch-Mode", "cors");
+            conn.setRequestProperty("Sec-Fetch-Dest", "empty");
 
-        InputStream is = conn.getInputStream();
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int len;
-        while ((len = is.read(buf)) != -1) {
-            baos.write(buf, 0, len);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (InputStream is = conn.getInputStream()) {
+                byte[] buf = new byte[8192];
+                int len;
+                while ((len = is.read(buf)) != -1) {
+                    baos.write(buf, 0, len);
+                }
+            }
+            raw = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
-        is.close();
 
-        String raw = new String(baos.toByteArray(), StandardCharsets.UTF_8);
         int start = raw.indexOf("{");
         if (start < 0) return new JSONObject();
         int depth = 0;
@@ -180,14 +188,21 @@ public class ChelaileApi {
         JSONObject data = jsonr.optJSONObject("data");
         if (data == null) return new JSONObject();
 
-        String enc = data.optString("encryptResult", null);
-        if (enc != null) {
-            byte[] rawBytes = Base64.decode(enc, Base64.DEFAULT);
-            SecretKeySpec key = new SecretKeySpec(getAesKey().getBytes(StandardCharsets.UTF_8), "AES");
-            Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
-            cipher.init(Cipher.DECRYPT_MODE, key);
-            byte[] decrypted = cipher.doFinal(rawBytes);
-            return new JSONObject(new String(decrypted, StandardCharsets.UTF_8));
+        if (!data.isNull("encryptResult")) {
+            String enc = data.optString("encryptResult", null);
+            if (enc != null && !enc.isEmpty() && !"null".equalsIgnoreCase(enc)) {
+                try {
+                    byte[] rawBytes = Base64.decode(enc, Base64.DEFAULT);
+                    SecretKeySpec key = new SecretKeySpec(getAesKey().getBytes(StandardCharsets.UTF_8), "AES");
+                    Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+                    cipher.init(Cipher.DECRYPT_MODE, key);
+                    byte[] decrypted = cipher.doFinal(rawBytes);
+                    return new JSONObject(new String(decrypted, StandardCharsets.UTF_8));
+                } catch (Exception e) {
+                    // 解密失败降级为空 JSONObject 而不是抛崩
+                    return new JSONObject();
+                }
+            }
         }
         return data;
     }

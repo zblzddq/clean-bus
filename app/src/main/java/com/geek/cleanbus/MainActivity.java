@@ -101,6 +101,18 @@ public class MainActivity extends Activity {
         mMainHandler.removeCallbacks(mAutoRefreshRunnable);
     }
 
+    @Override
+    protected void onDestroy() {
+        if (mLocationManager != null && mLocationListener != null) {
+            try {
+                mLocationManager.removeUpdates(mLocationListener);
+            } catch (Exception ignored) {}
+        }
+        mMainHandler.removeCallbacksAndMessages(null);
+        mExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
     /**
      * 1. 现代 Android 全面屏沉浸式适配
      */
@@ -342,6 +354,7 @@ public class MainActivity extends Activity {
         mExecutor.execute(() -> {
             CityLocator.CityResult cr = CityLocator.resolveCity(MainActivity.this, lat, lng);
             mMainHandler.post(() -> {
+                if (isFinishing() || isDestroyed()) return;
                 mCityId = cr.chelaileCityId;
                 mCityName = cr.cityName;
                 mTvLocStatus.setText("📍 " + mCityName + " (GPS: " + String.format("%.3f, %.3f", mCurrentLat, mCurrentLng) + ")");
@@ -370,9 +383,13 @@ public class MainActivity extends Activity {
         mExecutor.execute(() -> {
             try {
                 final JSONObject data = BusRepository.getInstance(MainActivity.this).getNearbyStops(mCurrentLat, mCurrentLng, mCityId);
-                mMainHandler.post(() -> renderStops(data));
+                mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    renderStops(data);
+                });
             } catch (final Exception e) {
                 mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
                     mProgressBar.setVisibility(View.GONE);
                     if (!isSilent) {
                         Toast.makeText(MainActivity.this, "加载失败: " + e.getMessage(), Toast.LENGTH_SHORT).show();
@@ -525,6 +542,7 @@ public class MainActivity extends Activity {
                     final String lTime = lineInfo != null ? lineInfo.optString("lastTime", "") : "";
 
                     mMainHandler.post(() -> {
+                        if (isFinishing() || isDestroyed()) return;
                         if (buses != null && buses.length() > 0) {
                             tvLive.setText("📍 全线在途 " + buses.length() + " 辆车 (点击查看实时位置)");
                             tvLive.setTextColor(Color.parseColor("#3fb950"));
@@ -630,6 +648,7 @@ public class MainActivity extends Activity {
                 JSONArray stationList = res.optJSONArray("stationList");
                 if (stationList != null && stationList.length() > 0) {
                     JSONObject st = stationList.optJSONObject(0);
+                    if (st == null) return;
                     JSONArray lines = st.optJSONArray("lines");
                     if (lines != null) {
                         final Map<String, String> arrivalMap = new HashMap<>();
@@ -642,6 +661,7 @@ public class MainActivity extends Activity {
                             JSONArray buses = li.optJSONArray("stnStates");
                             if (buses != null && buses.length() > 0) {
                                 JSONObject b = buses.optJSONObject(0);
+                                if (b == null) continue;
                                 int value = b.optInt("value", -1);
                                 int dist = b.optInt("distanceToDest", 0);
                                 double travelMin = b.optDouble("travelTime", 0) / 60.0;
@@ -651,6 +671,7 @@ public class MainActivity extends Activity {
 
                         if (!arrivalMap.isEmpty()) {
                             mMainHandler.post(() -> {
+                                if (isFinishing() || isDestroyed()) return;
                                 for (Map.Entry<String, String> entry : arrivalMap.entrySet()) {
                                     TextView tv = statusViews.get(entry.getKey());
                                     if (tv != null) {
@@ -771,8 +792,8 @@ public class MainActivity extends Activity {
         statusBg.setCornerRadius(dp(6));
         tvStatus.setBackground(statusBg);
 
-        if (buses != null && buses.length() > 0) {
-            JSONObject b0 = buses.optJSONObject(0);
+        JSONObject b0 = (buses != null && buses.length() > 0) ? buses.optJSONObject(0) : null;
+        if (b0 != null) {
             boolean dev0 = isBusDeviated(b0);
             if (!dev0) {
                 int value = b0.optInt("value", -1);
@@ -895,9 +916,13 @@ public class MainActivity extends Activity {
         mExecutor.execute(() -> {
             try {
                 final JSONObject res = BusRepository.getInstance(MainActivity.this).search(finalQuery, searchCity, mCurrentLat, mCurrentLng);
-                mMainHandler.post(() -> renderSearchResults(keyword, res));
+                mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    renderSearchResults(keyword, res);
+                });
             } catch (final Exception e) {
                 mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
                     mProgressBar.setVisibility(View.GONE);
                     Toast.makeText(MainActivity.this, "搜索失败: " + e.getMessage(), Toast.LENGTH_SHORT).show();
                 });

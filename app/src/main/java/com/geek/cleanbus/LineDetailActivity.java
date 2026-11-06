@@ -31,6 +31,7 @@ import org.json.JSONObject;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -113,6 +114,17 @@ public class LineDetailActivity extends Activity {
         return s1.contains(s2) || s2.contains(s1);
     }
 
+    private static int parseTimeToMinutes(String timeStr) {
+        if (timeStr == null || timeStr.isEmpty()) return -1;
+        String[] parts = timeStr.trim().split(":");
+        if (parts.length < 2) return -1;
+        try {
+            return Integer.parseInt(parts[0]) * 60 + Integer.parseInt(parts[1]);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     /**
      * 推算首末班与运营状态
      */
@@ -121,14 +133,30 @@ public class LineDetailActivity extends Activity {
             return "等待发车 / 暂无在途车辆";
         }
         try {
-            SimpleDateFormat sdf = new SimpleDateFormat("HH:mm", Locale.CHINA);
-            String nowStr = sdf.format(new Date());
-
-            if (nowStr.compareTo(firstTime) < 0) {
-                return "🌙 未到运营时间 (首班 " + firstTime + " 发车)";
+            int firstMin = parseTimeToMinutes(firstTime);
+            int lastMin = parseTimeToMinutes(lastTime);
+            if (firstMin < 0 || lastMin < 0) {
+                return "等待发车 / 暂无在途车辆";
             }
-            if (nowStr.compareTo(lastTime) > 0) {
-                return "🌙 今日已收班 (末班 " + lastTime + ")";
+
+            Calendar cal = Calendar.getInstance();
+            int nowMin = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE);
+
+            if (firstMin <= lastMin) {
+                // 当日普通班次
+                if (nowMin < firstMin) {
+                    return "🌙 未到运营时间 (首班 " + firstTime + " 发车)";
+                }
+                if (nowMin > lastMin) {
+                    return "🌙 今日已收班 (末班 " + lastTime + ")";
+                }
+            } else {
+                // 跨零点班次 (如 22:00 ~ 02:00)
+                // 运营区间: [firstMin, 1440) U [0, lastMin]
+                // 非运营区间: (lastMin, firstMin)
+                if (nowMin > lastMin && nowMin < firstMin) {
+                    return "🌙 未到运营时间 (首班 " + firstTime + " 发车)";
+                }
             }
             return "⏳ 运营中 · 暂无在途车辆 (预计发班间隔 10~15 分钟)";
         } catch (Exception e) {
@@ -178,6 +206,13 @@ public class LineDetailActivity extends Activity {
     protected void onPause() {
         super.onPause();
         mMainHandler.removeCallbacks(mAutoRefreshRunnable);
+    }
+
+    @Override
+    protected void onDestroy() {
+        mMainHandler.removeCallbacksAndMessages(null);
+        mExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     private void setupEdgeToEdge() {
@@ -411,9 +446,13 @@ public class LineDetailActivity extends Activity {
             try {
                 final JSONObject data = BusRepository.getInstance(LineDetailActivity.this).getLineDetail(mLineId, mCityId, mLat, mLng);
                 mCurrentData = data;
-                mMainHandler.post(() -> renderData(data, isSilent));
+                mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    renderData(data, isSilent);
+                });
             } catch (final Exception e) {
                 mMainHandler.post(() -> {
+                    if (isFinishing() || isDestroyed()) return;
                     mProgressBar.setVisibility(View.GONE);
                     if (!isSilent) {
                         mTvMetaInfo.setText("加载失败: " + e.getMessage());
@@ -719,6 +758,7 @@ public class LineDetailActivity extends Activity {
     private void scrollToStation(final View targetView) {
         if (targetView == null || mScrollView == null) return;
         mScrollView.post(() -> {
+            if (isFinishing() || isDestroyed()) return;
             int targetTop = targetView.getTop();
             int scrollHeight = mScrollView.getHeight();
             int targetHeight = targetView.getHeight();
