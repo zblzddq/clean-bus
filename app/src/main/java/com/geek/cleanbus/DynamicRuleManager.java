@@ -2,16 +2,30 @@ package com.geek.cleanbus;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.Base64;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * 动态规则配置中心管理器 (工业级高可用容错引擎)
@@ -19,6 +33,7 @@ import java.util.concurrent.Executors;
  * 2. 故障域隔离 (车来了与掌上公交独立版本)
  * 3. 候选槽 + 动静分离试探 (Pre-flight Probe, 不怕夜间收班)
  * 4. 连续失败熔断与 15 分钟冷却防抖
+ * 5. HMAC-SHA256 签名校验与域名白名单防劫持
  */
 public class DynamicRuleManager {
 
@@ -37,6 +52,9 @@ public class DynamicRuleManager {
 
     public static final String DEFAULT_MYGOLBS_URL = "https://h5.mygolbs.com/ApiData.do";
     public static final int DEFAULT_MYGOLBS_VER = 100;
+
+    // 客户端内置签名校验密钥 (与 Worker RULES_SECRET 保持一致，不走网络)
+    public static final String RULES_SECRET = "cleanbus_dynamic_rules_hmac_sha256_key";
 
     // 冷却时间与连续失败计数
     private long mLastCheckTimestamp = 0;
@@ -148,19 +166,52 @@ public class DynamicRuleManager {
         });
     }
 
-    private void processRemoteRules(JSONObject rules) {
+    void processRemoteRules(JSONObject rules) {
         if (rules == null) return;
 
-        // 1. 处理车来了规则热更
-        JSONObject chelaile = rules.optJSONObject("chelaile");
-        if (chelaile != null) {
-            int remoteVer = chelaile.optInt("version", 0);
-            if (remoteVer > getChelaileVersion()) {
-                String newUrl = chelaile.optString("baseUrl", getChelaileBaseUrl());
-                String newSalt = chelaile.optString("salt", getChelaileSalt());
-                String newKey = chelaile.optString("aesKey", getChelaileAesKey());
+        // 0. 提取签名与规则载体
+        String sig = rules.optString("sig", "");
+        if (sig.isEmpty()) {
+            // 缺少签名，整包丢弃
+            return;
+        }
 
-                // 候选槽试探 (Pre-flight Probe)：动静分离，只试探线路站点搜索，不受夜间收班影响
+        JSONObject rootObj = rules.has("rules") ? rules.optJSONObject("rules") : rules;
+        if (rootObj == null) return;
+
+        JSONObject chelaile = rootObj.optJSONObject("chelaile");
+        JSONObject mygolbs = rootObj.optJSONObject("mygolbs");
+        if (chelaile == null || mygolbs == null) {
+            return;
+        }
+
+        int ruleVer = rootObj.optInt("ruleVersion", 0);
+        JSONObject toSign = new JSONObject();
+        try {
+            toSign.put("chelaile", chelaile);
+            toSign.put("mygolbs", mygolbs);
+            toSign.put("ruleVersion", ruleVer);
+        } catch (Exception e) {
+            return;
+        }
+
+        // 规范化 JSON 并使用 Mac + MessageDigest.isEqual 常量时间校验
+        String canonical = canonicalJson(toSign);
+        if (!verifyHmacSha256(canonical, RULES_SECRET, sig)) {
+            // 验签失败直接丢弃整包，保留内置默认规则
+            return;
+        }
+
+        // 1. 处理车来了规则热更
+        int remoteChelaileVer = chelaile.optInt("version", 0);
+        if (remoteChelaileVer > getChelaileVersion()) {
+            String newUrl = chelaile.optString("baseUrl", getChelaileBaseUrl());
+            String newSalt = chelaile.optString("salt", getChelaileSalt());
+            String newKey = chelaile.optString("aesKey", getChelaileAesKey());
+
+            // 域名白名单与 https 协议校验
+            if (isAllowedHost(newUrl)) {
+                // 候选槽真实试探 (Pre-flight Probe)
                 if (probeChelaile(newUrl, newSalt, newKey)) {
                     // 转正生效，并将旧规则放入备份槽
                     backupCurrentChelaile();
@@ -168,43 +219,310 @@ public class DynamicRuleManager {
                             .putString("chelaile_base_url", newUrl)
                             .putString("chelaile_salt", newSalt)
                             .putString("chelaile_aes_key", newKey)
-                            .putInt("chelaile_version", remoteVer)
+                            .putInt("chelaile_version", remoteChelaileVer)
                             .apply();
                 }
             }
         }
 
         // 2. 处理掌上公交规则热更 (故障域隔离，互不影响)
-        JSONObject mygolbs = rules.optJSONObject("mygolbs");
-        if (mygolbs != null) {
-            int remoteVer = mygolbs.optInt("version", 0);
-            if (remoteVer > getMyGoLbsVersion()) {
-                String newUrl = mygolbs.optString("url", getMyGoLbsUrl());
+        int remoteMyGoLbsVer = mygolbs.optInt("version", 0);
+        if (remoteMyGoLbsVer > getMyGoLbsVersion()) {
+            String newUrl = mygolbs.optString("url", getMyGoLbsUrl());
+
+            // 域名白名单与 https 协议校验
+            if (isAllowedHost(newUrl)) {
+                // 真实发 CMD 103 试探且断言 data 非空
                 if (probeMyGoLbs(newUrl)) {
                     backupCurrentMyGoLbs();
                     mPrefs.edit()
                             .putString("mygolbs_url", newUrl)
-                    .putInt("mygolbs_version", remoteVer)
+                            .putInt("mygolbs_version", remoteMyGoLbsVer)
                             .apply();
                 }
             }
         }
     }
 
-    private boolean probeChelaile(String url, String salt, String key) {
+    /**
+     * 域名白名单校验：host 必须属于 chelaile.net.cn, mygolbs.com, workers.dev 且协议为 https
+     */
+    static boolean isAllowedHost(String urlStr) {
+        if (urlStr == null || urlStr.isEmpty()) return false;
         try {
-            // 轻量试探拉萨 16 路静态线路详情
-            JSONObject res = ChelaileApi.searchLines("16", "043", 29.654, 91.118);
-            return res != null && res.has("lines");
+            URL u = new URL(urlStr);
+            if (!"https".equalsIgnoreCase(u.getProtocol())) {
+                return false;
+            }
+            String host = u.getHost();
+            if (host == null) return false;
+            host = host.toLowerCase();
+            return isDomainOrSubdomain(host, "chelaile.net.cn")
+                    || isDomainOrSubdomain(host, "mygolbs.com")
+                    || isDomainOrSubdomain(host, "workers.dev");
         } catch (Exception e) {
             return false;
         }
     }
 
-    private boolean probeMyGoLbs(String url) {
+    private static boolean isDomainOrSubdomain(String host, String domain) {
+        return host.equals(domain) || host.endsWith("." + domain);
+    }
+
+    /**
+     * 规范化 JSON：按键字典序升序递归排序序列化
+     */
+    static String canonicalJson(Object val) {
+        if (val == null || val == JSONObject.NULL) return "null";
+        if (val instanceof JSONObject) {
+            JSONObject obj = (JSONObject) val;
+            List<String> keys = new ArrayList<>();
+            Iterator<String> it = obj.keys();
+            while (it.hasNext()) {
+                keys.add(it.next());
+            }
+            Collections.sort(keys);
+            StringBuilder sb = new StringBuilder("{");
+            for (int i = 0; i < keys.size(); i++) {
+                if (i > 0) sb.append(",");
+                String k = keys.get(i);
+                sb.append(quote(k)).append(":").append(canonicalJson(obj.opt(k)));
+            }
+            sb.append("}");
+            return sb.toString();
+        } else if (val instanceof JSONArray) {
+            JSONArray arr = (JSONArray) val;
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < arr.length(); i++) {
+                if (i > 0) sb.append(",");
+                sb.append(canonicalJson(arr.opt(i)));
+            }
+            sb.append("]");
+            return sb.toString();
+        } else if (val instanceof String) {
+            return quote((String) val);
+        } else if (val instanceof Number || val instanceof Boolean) {
+            return val.toString();
+        }
+        return quote(val.toString());
+    }
+
+    private static String quote(String s) {
+        StringBuilder sb = new StringBuilder("\"");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\b': sb.append("\\b"); break;
+                case '\f': sb.append("\\f"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 32) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                    break;
+            }
+        }
+        sb.append("\"");
+        return sb.toString();
+    }
+
+    /**
+     * 常量时间校验 HMAC-SHA256
+     */
+    static boolean verifyHmacSha256(String data, String secret, String expectedHex) {
         try {
-            // 轻量试探拉萨 16 路
-            return true;
+            Mac mac = Mac.getInstance("HmacSHA256");
+            SecretKeySpec keySpec = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            mac.init(keySpec);
+            byte[] hash = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : hash) {
+                hex.append(String.format("%02x", b));
+            }
+            return MessageDigest.isEqual(
+                hex.toString().toLowerCase().getBytes(StandardCharsets.UTF_8),
+                expectedHex.toLowerCase().getBytes(StandardCharsets.UTF_8)
+            );
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean probeChelaile(String url, String salt, String key) {
+        try {
+            Map<String, String> params = new HashMap<>();
+            params.put("s", "h5");
+            params.put("wxs", "wx_app");
+            params.put("sign", "1");
+            params.put("h5RealData", "1");
+            params.put("v", "3.11.28");
+            params.put("src", "weixinapp_cx");
+            params.put("ctm_mp", "mp_wx");
+            params.put("vc", "2");
+            params.put("favoriteGray", "1");
+            params.put("gpstype", "wgs");
+            params.put("geo_type", "wgs");
+            params.put("scene", "1256");
+            params.put("cityId", "043");
+            params.put("localCityId", "043");
+            params.put("key", "16");
+            params.put("supportPhyStn", "true");
+            params.put("lat", "29.654");
+            params.put("lng", "91.118");
+            params.put("geo_lat", "29.654");
+            params.put("geo_lng", "91.118");
+
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                if (!first) sb.append("&");
+                sb.append("\"").append(entry.getKey()).append("\"=\"").append(entry.getValue()).append("\"");
+                first = false;
+            }
+            sb.append(salt);
+
+            MessageDigest md5 = MessageDigest.getInstance("MD5");
+            byte[] digest = md5.digest(sb.toString().getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : digest) {
+                hex.append(String.format("%02x", b));
+            }
+            params.put("cryptoSign", hex.toString());
+
+            String base = url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+            StringBuilder urlBuilder = new StringBuilder(base).append("/bus/query!nSearch.action?");
+            first = true;
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                if (!first) urlBuilder.append("&");
+                urlBuilder.append(URLEncoder.encode(entry.getKey(), "UTF-8"))
+                          .append("=")
+                          .append(URLEncoder.encode(entry.getValue(), "UTF-8"));
+                first = false;
+            }
+
+            URL reqUrl = new URL(urlBuilder.toString());
+            HttpURLConnection conn = (HttpURLConnection) reqUrl.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(10000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 MicroMessenger/7.0.20.1781");
+            conn.setRequestProperty("Referer", "https://servicewechat.com/wx71d589ea01ce3321/814/page-frame.html");
+            conn.setRequestProperty("xweb_xhr", "1");
+            conn.setRequestProperty("Sec-Fetch-Site", "cross-site");
+            conn.setRequestProperty("Sec-Fetch-Mode", "cors");
+            conn.setRequestProperty("Sec-Fetch-Dest", "empty");
+
+            if (conn.getResponseCode() != 200) {
+                return false;
+            }
+
+            InputStream is = conn.getInputStream();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int len;
+            while ((len = is.read(buf)) != -1) {
+                baos.write(buf, 0, len);
+            }
+            is.close();
+
+            String raw = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+            int start = raw.indexOf("{");
+            if (start < 0) return false;
+            int depth = 0;
+            int end = start;
+            for (int i = start; i < raw.length(); i++) {
+                char c = raw.charAt(i);
+                if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) {
+                        end = i + 1;
+                        break;
+                    }
+                }
+            }
+
+            JSONObject envelope = new JSONObject(raw.substring(start, end));
+            JSONObject jsonr = envelope.optJSONObject("jsonr");
+            if (jsonr == null) return false;
+            JSONObject data = jsonr.optJSONObject("data");
+            if (data == null) return false;
+
+            JSONObject decryptedObj = data;
+            String enc = data.optString("encryptResult", null);
+            if (enc != null && !enc.isEmpty() && !"null".equals(enc)) {
+                byte[] rawBytes = Base64.decode(enc, Base64.DEFAULT);
+                SecretKeySpec keySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "AES");
+                Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
+                cipher.init(Cipher.DECRYPT_MODE, keySpec);
+                byte[] decrypted = cipher.doFinal(rawBytes);
+                decryptedObj = new JSONObject(new String(decrypted, StandardCharsets.UTF_8));
+            }
+            JSONArray lines = decryptedObj.optJSONArray("lines");
+            return lines != null && lines.length() > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean probeMyGoLbs(String urlStr) {
+        try {
+            Map<String, String> params = new HashMap<>();
+            params.put("CMD", "103");
+            params.put("CITYNAME", "兴义市");
+            params.put("LINENAME", "1路");
+            params.put("DIRECTION", "1");
+            params.put("CITYKEY", "");
+
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                if (sb.length() > 0) sb.append("&");
+                sb.append(URLEncoder.encode(entry.getKey(), "UTF-8"))
+                  .append("=")
+                  .append(URLEncoder.encode(entry.getValue() != null ? entry.getValue() : "", "UTF-8"));
+            }
+            byte[] bodyBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+            URL url = new URL(urlStr);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            conn.setDoInput(true);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+            conn.setRequestProperty("Origin", "https://h5.mygolbs.com");
+            conn.setRequestProperty("Referer", "https://h5.mygolbs.com/");
+            conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+            conn.setRequestProperty("Accept", "application/json, text/javascript, */*; q=0.01");
+
+            conn.getOutputStream().write(bodyBytes);
+            conn.getOutputStream().flush();
+
+            if (conn.getResponseCode() != 200) {
+                return false;
+            }
+
+            InputStream is = conn.getInputStream();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = is.read(buf)) != -1) {
+                baos.write(buf, 0, n);
+            }
+            is.close();
+
+            String resStr = baos.toString("UTF-8").trim();
+            JSONObject res = new JSONObject(resStr);
+            JSONArray data = res.optJSONArray("data");
+            return data != null && data.length() > 0;
         } catch (Exception e) {
             return false;
         }
@@ -243,4 +561,3 @@ public class DynamicRuleManager {
                 .apply();
     }
 }
-
