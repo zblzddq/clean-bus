@@ -112,3 +112,44 @@ POST /api/v1/report
 2. **H5 协议复用不可行**——签名算法已从 bundle 还原（`md5(JSON.stringify(params)去括号,:/=,,/& + salt)`），但按此构造的请求一律 `status:400`，缺请求头或会话参数，需要真实浏览器抓包才能补齐，收益不抵成本。
 3. **APK 签名是 debug keystore**——`build_clean_bus.ps1` 在未提供 `CLEANBUS_KS` 时会退化到 debug 签名；正式分发前必须配置 release keystore，否则用户无法覆盖升级。
 4. **无 CI**——编译与签名验证目前靠本地脚本 `build_clean_bus.ps1` 与人工复核。
+
+## 6. 断供告警（GitHub Issue → 邮件）
+
+Worker cron 每 30 分钟在嗅探之后检查健康计数，命中阈值自动开 issue。
+
+### 6.1 配置
+
+```bash
+# 1) 给 Worker 一个只能建 issue 的 token（建议 fine-grained: issues:write）
+wrangler secret put GH_ALERT_TOKEN
+
+# 2) wrangler.toml 增加变量
+[vars]
+GH_REPO = "zblzddq/clean-bus"
+ALERT_THRESHOLD = "5"
+
+wrangler deploy
+```
+
+### 6.2 邮件如何到 277011444@qq.com
+
+Cloudflare Worker 不能直接发 SMTP，所以走 **GitHub Issue → GitHub 通知邮件**：
+
+1. GitHub → Settings → Emails 添加 `277011444@qq.com` 并完成验证
+2. 设为 Primary 或在 Notifications 里勾选该地址接收通知
+3. 确认 Watching 了 `zblzddq/clean-bus`
+
+### 6.3 演练（上线后必做一次）
+
+```bash
+curl -X POST https://cleanbus.277011444.workers.dev/api/v1/triggerAlert \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+- 首次调用只建基线，不发 issue（避免历史计数误报）
+- 去重：同一源 6 小时内最多一条
+
+### 6.4 告警内容
+
+标题 `[CleanBus] 车来了疑似断供（新增 N 次失败）`，正文含源、最后失败类型与时间、累计次数，
+以及可直接复制的轮换 curl。处理后查 `GET /api/v1/status` 看计数是否停止增长。
