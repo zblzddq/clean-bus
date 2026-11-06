@@ -147,8 +147,11 @@ public class BusRepository {
         // 1. 若 lineId 带有 @@@ 特征，表明是掌上公交格式的线路
         if (lineId != null && lineId.contains("@@@")) {
             try {
-                return mMyGoLbsSource.getLineDetail(lineId, cityId, lat, lng);
+                JSONObject r = mMyGoLbsSource.getLineDetail(lineId, cityId, lat, lng);
+                HealthReporter.recordSuccess("mygolbs");
+                return r;
             } catch (Exception e) {
+                HealthReporter.recordFailure("mygolbs", classifyFailure(e));
                 DynamicRuleManager.getInstance().recordApiFailure("mygolbs", e);
             }
         }
@@ -156,8 +159,11 @@ public class BusRepository {
         // 2. 本地首选源（国内直连，80ms极速）
         IBusDataSource primary = getSourceForCity(cityId);
         try {
-            return primary.getLineDetail(lineId, cityId, lat, lng);
+            JSONObject r = primary.getLineDetail(lineId, cityId, lat, lng);
+            HealthReporter.recordSuccess(primary.getSourceId());
+            return r;
         } catch (Exception e) {
+            HealthReporter.recordFailure(primary.getSourceId(), classifyFailure(e));
             DynamicRuleManager.getInstance().recordApiFailure(primary.getSourceId(), e);
             // 尝试本地备用源
             for (IBusDataSource src : mSources) {
@@ -187,7 +193,10 @@ public class BusRepository {
         JSONObject res = null;
         try {
             res = primary.search(keyword, cityId, lat, lng);
-        } catch (Exception ignored) {}
+            HealthReporter.recordSuccess(primary.getSourceId());
+        } catch (Exception e) {
+            HealthReporter.recordFailure(primary.getSourceId(), classifyFailure(e));
+        }
 
         JSONArray pLines = res != null ? res.optJSONArray("lines") : null;
         if (pLines != null && pLines.length() > 0) {
@@ -220,5 +229,13 @@ public class BusRepository {
         }
 
         return res != null ? res : new JSONObject();
+    }
+
+    /** 把异常归类成 Worker 侧认的 kind，避免把堆栈原样外发 */
+    private static String classifyFailure(Exception e) {
+        if (e instanceof java.net.SocketTimeoutException) return "timeout";
+        if (e instanceof java.io.IOException) return "http-error";
+        if (e instanceof org.json.JSONException) return "parse-fail";
+        return "parse-fail";
     }
 }
