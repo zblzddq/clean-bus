@@ -146,10 +146,11 @@ $ksPath = if ($env:CLEANBUS_KS) { $env:CLEANBUS_KS } elseif ($env:KS_PATH) { $en
 $ksPass = if ($env:CLEANBUS_KS_PASS) { $env:CLEANBUS_KS_PASS } elseif ($env:KS_PASS) { $env:KS_PASS } else { $null }
 
 if ($ksPath -and (Test-Path $ksPath)) {
-    Write-Host "Signing with release keystore: $ksPath"
-    $signerArgs += @('--ks', $ksPath)
+    $ksAlias = if ($env:CLEANBUS_KS_ALIAS) { $env:CLEANBUS_KS_ALIAS } else { 'cleanbus' }
+    Write-Host "Signing with release keystore: $ksPath (alias=$ksAlias)"
+    $signerArgs += @('--ks', $ksPath, '--ksAlias', $ksAlias, '--allowResign')
     if ($ksPass) {
-        $signerArgs += @('--ksPass', $ksPass)
+        $signerArgs += @('--ksPass', $ksPass, '--ksKeyPass', $ksPass)
     }
 } else {
     Write-Host "No release keystore provided via CLEANBUS_KS, signing with default debug key..."
