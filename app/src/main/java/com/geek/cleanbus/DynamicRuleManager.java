@@ -121,10 +121,11 @@ public class DynamicRuleManager {
      */
     public void triggerAsyncSync(final boolean force) {
         mExecutor.execute(() -> {
+            HttpURLConnection conn = null;
             try {
                 String gatewayUrl = BusRepository.DEFAULT_GATEWAY_URL;
                 URL url = new URL(gatewayUrl + "/api/v1/rules");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("GET");
                 conn.setConnectTimeout(4000);
                 conn.setReadTimeout(4000);
@@ -132,19 +133,25 @@ public class DynamicRuleManager {
 
                 if (conn.getResponseCode() != 200) return;
 
-                InputStream is = conn.getInputStream();
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                byte[] buf = new byte[2048];
-                int n;
-                while ((n = is.read(buf)) != -1) {
-                    baos.write(buf, 0, n);
+                try (InputStream is = conn.getInputStream()) {
+                    byte[] buf = new byte[2048];
+                    int n;
+                    while ((n = is.read(buf)) != -1) {
+                        baos.write(buf, 0, n);
+                    }
                 }
                 String jsonStr = baos.toString("UTF-8");
                 JSONObject remoteRules = new JSONObject(jsonStr);
 
                 // 校验与分别试探转正
                 processRemoteRules(remoteRules);
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+            }
         });
     }
 

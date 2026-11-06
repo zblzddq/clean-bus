@@ -79,22 +79,24 @@ public class CityLocator {
         }
 
         // 3. 网络开放逆地理编码 (OSM Nominatim)
+        HttpURLConnection conn = null;
         try {
             String urlStr = "https://nominatim.openstreetmap.org/reverse?format=json&lat=" + lat + "&lon=" + lng + "&zoom=10";
             URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
             conn.setConnectTimeout(4000);
             conn.setReadTimeout(4000);
             conn.setRequestProperty("User-Agent", "CleanBusApp/1.0");
 
             if (conn.getResponseCode() == 200) {
-                InputStream is = conn.getInputStream();
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                byte[] buf = new byte[1024];
-                int len;
-                while ((len = is.read(buf)) != -1) {
-                    baos.write(buf, 0, len);
+                try (InputStream is = conn.getInputStream()) {
+                    byte[] buf = new byte[1024];
+                    int len;
+                    while ((len = is.read(buf)) != -1) {
+                        baos.write(buf, 0, len);
+                    }
                 }
                 JSONObject obj = new JSONObject(baos.toString("UTF-8"));
                 JSONObject addr = obj.optJSONObject("address");
@@ -109,7 +111,12 @@ public class CityLocator {
                     }
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception ignored) {
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
 
         // 默认兜底：拉萨市
         return new CityResult("拉萨市", "043");
