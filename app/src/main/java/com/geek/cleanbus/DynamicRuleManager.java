@@ -68,7 +68,7 @@ public class DynamicRuleManager {
      * openssl ec -in ec_private.pem -pubout -outform DER -out ec_public.der
      * openssl base64 -in ec_public.der -out ec_public.b64
      */
-    public static final String PUBLIC_RULE_KEY_SPKI_B64 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfmhjeSQqCdZ0ClkF0+WCoNQm1oGefJIr9qt3LwOYztkRWrNu5oNQjYWf3Tu90Q1qAxpNhCSw4uwaeZPjvJlOGw==";
+    public static final String PUBLIC_RULE_KEY_SPKI_B64 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQJDiJaSnlsXOX7csgS1O31GJrw7xUgyMrNoUVFxMIrGubRJ8jDGoAuD02RonRtO5IsE/9I4nNcTGAw40+HXZVw==";
 
     // 冷却时间与连续失败计数
     private long mLastCheckTimestamp = 0;
