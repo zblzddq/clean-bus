@@ -153,3 +153,24 @@ curl -X POST https://cleanbus.277011444.workers.dev/api/v1/triggerAlert \
 
 标题 `[CleanBus] 车来了疑似断供（新增 N 次失败）`，正文含源、最后失败类型与时间、累计次数，
 以及可直接复制的轮换 curl。处理后查 `GET /api/v1/status` 看计数是否停止增长。
+
+### 6.5 为什么改由 GitHub Actions 建 issue（重要）
+
+实测结论：**用你自己的 PAT 建 issue 不会收到邮件**——GitHub 不给「自己创建的内容」发通知，
+即使仓库 Watch 是 All Activity、Default notifications email 已设为 QQ 邮箱。
+
+因此告警改由 `.github/workflows/alert.yml` 执行（每 30 分钟）：
+
+- 以 `github-actions[bot]` 身份建 issue → actor 不是你 → 邮件正常送达
+- 同源已有未关闭的 `ops-alert` issue 时不会重复开
+- 恢复后会在现存 issue 下评论，提醒你确认关闭
+- 不需要 `GH_ALERT_TOKEN`；Worker 侧的 `checkAndAlert()` 在缺 token 时会自动跳过，可保留作为备用
+
+演练：
+
+```bash
+gh workflow run alert.yml            # 手动跑一次
+gh run watch                         # 看日志
+```
+
+若 `/api/v1/status` 未部署（返回旧格式，无 `sources` 字段），工作流会安全跳过，不误报。
