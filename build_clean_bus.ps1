@@ -84,15 +84,16 @@ New-Item -ItemType Directory -Path $dexDir -Force | Out-Null
 $classes = Get-ChildItem -Path $classesDir -Recurse -Filter '*.class' | Select-Object -ExpandProperty FullName
 
 $r8Args = @(
-    '-cp', $R8_JAR,
-    'com.android.tools.r8.R8',
-    '--release',
-    '--min-api', '26',
-    '--lib', $ANDROID_JAR,
-    '--output', $dexDir
+    '-cp', $R8_JAR
 )
-if (Test-Path $PROGUARD_RULES) {
-    $r8Args += @('--pg-conf', $PROGUARD_RULES)
+if ($env:CLEANBUS_USE_D8 -eq '1') {
+    Write-Host '[2/4] D8 desugaring (no shrinking, R8 optimizer disabled)...'
+    $r8Args += @('com.android.tools.r8.D8', '--min-api', '26', '--lib', $ANDROID_JAR, '--output', $dexDir)
+} else {
+    $r8Args += @('com.android.tools.r8.R8', '--release', '--min-api', '26', '--lib', $ANDROID_JAR, '--output', $dexDir)
+    if (Test-Path $PROGUARD_RULES) {
+        $r8Args += @('--pg-conf', $PROGUARD_RULES)
+    }
 }
 $r8Args += $classes
 
@@ -191,3 +192,4 @@ Write-Host ">>> Version atomically updated in version.json: v$newName (versionCo
 
 Write-Host "BUILD SUCCESS: Created $versionedApkName and $releaseApkName"
 Get-Item $versionedApkName, $releaseApkName | Select-Object Name, Length, LastWriteTime
+
