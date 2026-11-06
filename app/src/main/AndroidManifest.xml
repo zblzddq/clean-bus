@@ -23,7 +23,8 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@android:drawable/ic_dialog_map"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="纯净公交"
         android:supportsRtl="true"
         android:resizeableActivity="true"

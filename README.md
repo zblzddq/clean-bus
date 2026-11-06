@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshots/app_icon_512.png" width="112" height="112" alt="CleanBus App Icon" style="border-radius: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.15);">
+</p>
+
 # CleanBus (纯净公交)
 
 <p align="center">
@@ -120,3 +124,4 @@ cd clean_bus_app
 ## 📄 开源许可证
 
 本项目基于 [MIT License](LICENSE) 开源。仅供技术学习交流与个人出行便捷使用。
+

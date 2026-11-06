@@ -57,10 +57,18 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# 3. AAPT2 链接打包 (带入版本号)
-Write-Host "[3/4] AAPT2 link (injecting v$newName, code $newCode)..."
+# 3. AAPT2 编译资源与链接打包 (带入版本号)
+Write-Host "[3/4] AAPT2 compile & link (injecting v$newName, code $newCode)..."
 Remove-Item -Path 'build\unaligned.apk' -Force -ErrorAction SilentlyContinue
-& $AAPT2 link -o 'build\unaligned.apk' -I $ANDROID_JAR --manifest 'app\src\main\AndroidManifest.xml' `
+Remove-Item -Path 'build\res.zip' -Force -ErrorAction SilentlyContinue
+
+& $AAPT2 compile --dir 'app\src\main\res' -o 'build\res.zip'
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "AAPT2 compile failed with exit code $LASTEXITCODE"
+    exit 1
+}
+
+& $AAPT2 link -o 'build\unaligned.apk' -I $ANDROID_JAR -R 'build\res.zip' --manifest 'app\src\main\AndroidManifest.xml' `
     --min-sdk-version 26 --target-sdk-version 34 `
     --version-code $newCode --version-name $newName --replace-version
 if ($LASTEXITCODE -ne 0) {
