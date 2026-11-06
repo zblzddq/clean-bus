@@ -464,6 +464,43 @@ public class DynamicRuleManager {
             is.close();
 
             String raw = new String(baos.toByteArray(), StandardCharsets.UTF_8);
+            return parseAndValidateChelaileResponse(raw, key);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 从任意层级提取 lines：obj.lines / obj.result.lines / obj.data.lines / obj.data.result.lines
+     */
+    static JSONArray extractLines(JSONObject obj) {
+        if (obj == null) return null;
+        JSONArray lines = obj.optJSONArray("lines");
+        if (lines != null) return lines;
+        JSONObject result = obj.optJSONObject("result");
+        if (result != null) {
+            lines = result.optJSONArray("lines");
+            if (lines != null) return lines;
+        }
+        JSONObject nested = obj.optJSONObject("data");
+        if (nested != null) {
+            lines = nested.optJSONArray("lines");
+            if (lines != null) return lines;
+            JSONObject r2 = nested.optJSONObject("result");
+            if (r2 != null) {
+                lines = r2.optJSONArray("lines");
+            }
+        }
+        return lines;
+    }
+
+    /**
+     * 校验车来了探针响应：兼容三种形态（data.lines、data.result.lines、encryptResult解密），
+     * 强校验 jsonr.status == "00" 且 lines 至少包含一个非空对象（DTO 兜底）。
+     */
+    static boolean parseAndValidateChelaileResponse(String raw, String key) {
+        if (raw == null || raw.isEmpty()) return false;
+        try {
             int start = raw.indexOf("{");
             if (start < 0) return false;
             int depth = 0;
@@ -483,21 +520,56 @@ public class DynamicRuleManager {
             JSONObject envelope = new JSONObject(raw.substring(start, end));
             JSONObject jsonr = envelope.optJSONObject("jsonr");
             if (jsonr == null) return false;
+
+            // 1. status 三级兜底：jsonr.status -> data.status -> 缺省
+            //    真实上游成功响应把 status 放在 jsonr.data 层（见抓包：
+            //    {"jsonr":{"data":{"result":{...},"status":"00"}}}），
+            //    错误响应则放在 jsonr 层（{"jsonr":{"status":"400",...}}）。
             JSONObject data = jsonr.optJSONObject("data");
+            String status = jsonr.optString("status", "");
+            if (status.isEmpty() && data != null) {
+                status = data.optString("status", "");
+            }
+            // 有 status 时必须为 "00"；两个层级都没有 status 时不因缺字段判失败，交由 lines 判定
+            if (!status.isEmpty() && !"00".equals(status)) {
+                return false;
+            }
+
             if (data == null) return false;
 
-            JSONObject decryptedObj = data;
+            // 2. 解析兼容三种形态：
+            //   - encryptResult 密文（必须成功解密且含 lines）
+            //   - data.lines
+            //   - data.result.lines
+            JSONArray lines = null;
             String enc = data.optString("encryptResult", null);
-            if (enc != null && !enc.isEmpty() && !"null".equals(enc)) {
-                byte[] rawBytes = Base64.decode(enc, Base64.DEFAULT);
+            if (enc != null && !enc.isEmpty() && !"null".equalsIgnoreCase(enc)) {
+                if (key == null || key.isEmpty()) return false;
+                byte[] rawBytes = decodeBase64(enc);
                 SecretKeySpec keySpec = new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "AES");
                 Cipher cipher = Cipher.getInstance("AES/ECB/PKCS5Padding");
                 cipher.init(Cipher.DECRYPT_MODE, keySpec);
                 byte[] decrypted = cipher.doFinal(rawBytes);
-                decryptedObj = new JSONObject(new String(decrypted, StandardCharsets.UTF_8));
+                JSONObject decryptedObj = new JSONObject(new String(decrypted, StandardCharsets.UTF_8));
+                lines = extractLines(decryptedObj);
+            } else {
+                lines = extractLines(data);
             }
-            JSONArray lines = decryptedObj.optJSONArray("lines");
-            return lines != null && lines.length() > 0;
+
+            if (lines == null || lines.length() == 0) {
+                return false;
+            }
+
+            // 3. DTO 层兜底：验证 lines 数组中至少存在一个有效的非空对象
+            boolean hasValidLine = false;
+            for (int i = 0; i < lines.length(); i++) {
+                JSONObject lineObj = lines.optJSONObject(i);
+                if (lineObj != null && lineObj.length() > 0) {
+                    hasValidLine = true;
+                    break;
+                }
+            }
+            return hasValidLine;
         } catch (Exception e) {
             return false;
         }

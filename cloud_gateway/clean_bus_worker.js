@@ -80,6 +80,42 @@ async function saveRules(env, newRules) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// 上游健康上报（客户端侧静默失败转成可观测信号）
+// 存储：KV health:<source> -> { count, lastAt, lastKind, lastVersion }
+// 限流：KV health_rl:<ip>    -> 60s 一条，防刷
+// ---------------------------------------------------------------------------
+const HEALTH_SOURCES = new Set(["chelaile", "mygolbs"]);
+const HEALTH_KINDS = new Set(["decrypt-fail", "parse-fail", "empty", "http-error", "timeout"]);
+
+async function recordHealth(env, source, kind, clientVersion) {
+  if (!env || !env.RULES_KV) return null;
+  const key = "health:" + source;
+  let cur = null;
+  try {
+    cur = await env.RULES_KV.get(key, "json");
+  } catch (e) {
+    cur = null;
+  }
+  const next = {
+    count: (cur && Number.isFinite(cur.count) ? cur.count : 0) + 1,
+    lastAt: new Date().toISOString(),
+    lastKind: kind,
+    lastVersion: clientVersion || (cur && cur.lastVersion) || ""
+  };
+  await env.RULES_KV.put(key, JSON.stringify(next));
+  return next;
+}
+
+async function readHealth(env, source) {
+  if (!env || !env.RULES_KV) return null;
+  try {
+    return await env.RULES_KV.get("health:" + source, "json");
+  } catch (e) {
+    return null;
+  }
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -124,6 +160,85 @@ export default {
         }, 200, {
           'Cache-Control': 'public, max-age=300'
         });
+      }
+
+      // 客户端上游健康上报：POST，无需鉴权但按 IP 限流 1 条/分钟
+      if (pathname === '/api/v1/report') {
+        if (request.method !== 'POST') {
+          return jsonResponse({ error: 'Method Not Allowed: POST required', code: 405 }, 405, { 'Allow': 'POST' });
+        }
+
+        const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+        const rlKey = 'health_rl:' + ip;
+        // 注意：return 必须放在 try 外面。204 不能带 body，若在 try 内构造响应抛错，
+        // 会被下面的 KV 异常兜底吞掉，导致限流静默失效。
+        let throttled = false;
+        if (env && env.RULES_KV) {
+          try {
+            const last = await env.RULES_KV.get(rlKey);
+            if (last && Date.now() - parseInt(last, 10) < 60 * 1000) {
+              throttled = true;
+            } else {
+              await env.RULES_KV.put(rlKey, Date.now().toString(), { expirationTtl: 120 });
+            }
+          } catch (e) {}
+        }
+        if (throttled) {
+          return new Response(null, {
+            status: 204,
+            headers: {
+              'Access-Control-Allow-Origin': '*',
+              'Cache-Control': 'no-store'
+            }
+          });
+        }
+
+        let body = null;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return jsonResponse({ error: 'Invalid JSON body', code: 400 }, 400);
+        }
+
+        const source = String((body && body.source) || '');
+        const kind = String((body && body.kind) || '');
+        if (!HEALTH_SOURCES.has(source) || !HEALTH_KINDS.has(kind)) {
+          return jsonResponse({ error: 'Invalid source or kind', code: 400 }, 400);
+        }
+        const clientVersion = String((body && body.version) || '').slice(0, 24);
+
+        const health = await recordHealth(env, source, kind, clientVersion);
+        return jsonResponse({ ok: true, recorded: health != null }, 200, { 'Cache-Control': 'no-store' });
+      }
+
+      // 运维视图：一眼看出两个上游各自是否还活着
+      if (pathname === '/api/v1/status') {
+        const rules = await getRules(env);
+        const [chelaileHealth, mygolbsHealth] = await Promise.all([
+          readHealth(env, 'chelaile'),
+          readHealth(env, 'mygolbs')
+        ]);
+        return jsonResponse({
+          ok: true,
+          ruleVersion: rules.ruleVersion,
+          keyVerified: rules.keyVerified === true,
+          lastSniffStatus: rules.lastSniffStatus || null,
+          lastSniffTime: rules.lastSniffTime || null,
+          sources: {
+            chelaile: {
+              version: rules.chelaile && rules.chelaile.version,
+              host: rules.chelaile && rules.chelaile.baseUrl,
+              keyVerified: rules.chelaile && rules.chelaile.keyVerified === true,
+              health: chelaileHealth
+            },
+            mygolbs: {
+              version: rules.mygolbs && rules.mygolbs.version,
+              host: rules.mygolbs && rules.mygolbs.url,
+              keyVerified: rules.mygolbs && rules.mygolbs.keyVerified === true,
+              health: mygolbsHealth
+            }
+          }
+        }, 200, { 'Cache-Control': 'no-store' });
       }
 
       // 嗅探测试端点：鉴权 + POST 限流
