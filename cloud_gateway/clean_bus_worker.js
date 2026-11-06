@@ -9,6 +9,7 @@
 // 出厂基线默认规则
 const DEFAULT_RULES = {
   ruleVersion: 2026110602,
+  keyVerified: true,
   chelaile: {
     version: 101,
     baseUrl: "https://web.chelaile.net.cn/api",
@@ -25,9 +26,6 @@ const DEFAULT_RULES = {
   lastSniffTime: new Date().toISOString(),
   lastSniffStatus: "idle"
 };
-
-// 签名默认备用秘钥 (生产环境由 env.RULES_SECRET / wrangler secret 注入)
-const DEFAULT_RULES_SECRET = "cleanbus_dynamic_rules_hmac_sha256_key";
 
 // 内存同 isolate 缓存
 let inMemoryRules = null;
@@ -96,8 +94,15 @@ export default {
     }
 
     try {
-      // 1. 动态规则分发端点 (附 HMAC-SHA256 签名与 Cache-Control)
+      // 1. 动态规则分发端点 (附 ECDSA P-256 签名与 Cache-Control)
       if (pathname === '/api/v1/rules') {
+        if (!env || !env.RULES_SIGNING_KEY) {
+          return jsonResponse({
+            code: 503,
+            error: 'Rule signing key not configured (RULES_SIGNING_KEY missing)'
+          }, 503);
+        }
+
         const rules = await getRules(env);
         const rulesToSign = {
           chelaile: rules.chelaile,
@@ -105,11 +110,11 @@ export default {
           ruleVersion: rules.ruleVersion
         };
         const canonical = canonicalJson(rulesToSign);
-        const secret = (env && env.RULES_SECRET) || DEFAULT_RULES_SECRET;
-        const sig = await hmacSha256Hex(canonical, secret);
+        const sig = await signEcdsaP256DerB64(canonical, env.RULES_SIGNING_KEY);
 
         return jsonResponse({
           ...rules,
+          keyVerified: rules.keyVerified !== undefined ? rules.keyVerified : true,
           sig
         }, 200, {
           'Cache-Control': 'public, max-age=300'
@@ -187,20 +192,69 @@ function canonicalJson(val) {
   return '{' + keys.map(k => JSON.stringify(k) + ':' + canonicalJson(val[k])).join(',') + '}';
 }
 
-// SubtleCrypto HMAC-SHA256
-async function hmacSha256Hex(message, secret) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
+function formatDerInteger(bytes) {
+  let start = 0;
+  while (start < bytes.length - 1 && bytes[start] === 0) {
+    start++;
+  }
+  const slice = bytes.slice(start);
+  if (slice[0] & 0x80) {
+    const padded = new Uint8Array(slice.length + 1);
+    padded[0] = 0x00;
+    padded.set(slice, 1);
+    return padded;
+  }
+  return slice;
+}
+
+function rawP1363ToDer(rawSig) {
+  const raw = new Uint8Array(rawSig);
+  if (raw.length !== 64) {
+    throw new Error(`Invalid raw signature length: ${raw.length}`);
+  }
+  const rBytes = formatDerInteger(raw.slice(0, 32));
+  const sBytes = formatDerInteger(raw.slice(32, 64));
+  const totalLen = 2 + rBytes.length + 2 + sBytes.length;
+  const der = new Uint8Array(2 + totalLen);
+  der[0] = 0x30;
+  der[1] = totalLen;
+  let offset = 2;
+  der[offset++] = 0x02;
+  der[offset++] = rBytes.length;
+  der.set(rBytes, offset);
+  offset += rBytes.length;
+  der[offset++] = 0x02;
+  der[offset++] = sBytes.length;
+  der.set(sBytes, offset);
+  return der;
+}
+
+async function signEcdsaP256DerB64(message, pkcs8B64) {
+  const binaryDer = atob(pkcs8B64.trim());
+  const derBytes = new Uint8Array(binaryDer.length);
+  for (let i = 0; i < binaryDer.length; i++) {
+    derBytes[i] = binaryDer.charCodeAt(i);
+  }
+
+  const privKey = await crypto.subtle.importKey(
+    'pkcs8',
+    derBytes.buffer,
+    { name: 'ECDSA', namedCurve: 'P-256' },
     false,
     ['sign']
   );
-  const signature = await crypto.subtle.sign('HMAC', key, enc.encode(message));
-  return Array.from(new Uint8Array(signature))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+  const enc = new TextEncoder();
+  const rawSig = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    privKey,
+    enc.encode(message)
+  );
+  const derSig = rawP1363ToDer(rawSig);
+  let binary = '';
+  for (let i = 0; i < derSig.length; i++) {
+    binary += String.fromCharCode(derSig[i]);
+  }
+  return btoa(binary);
 }
 
 // SubtleCrypto SHA-256
@@ -268,7 +322,7 @@ async function autoSniffAndSelfHeal(env) {
     const targetApiUrl = `https://h5.mygolbs.com/${extractedApiRoot.replace(/^\//, '')}`;
     result.details = { mybusUrl, encUrl, targetApiUrl, extractedKeys };
 
-    // 5. 动静分离自动化冒烟测试 (P0-3 真验活)
+    // 5. 动静分离自动化冒烟测试 (P0-3 真验活与如实报告)
     const rawSmokeText = await callMyGoLbsRaw(targetApiUrl, {
       CMD: '102',
       CITYNAME: '兴义市',
@@ -276,33 +330,42 @@ async function autoSniffAndSelfHeal(env) {
       CITYKEY: ''
     });
 
+    const trimmed = (rawSmokeText || "").trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      // 若上游返回明文 JSON：不许做自往返。
+      currentRules.lastSniffStatus = "Unverified: upstream plaintext, keys not proven";
+      currentRules.lastSniffTime = new Date().toISOString();
+      currentRules.keyVerified = false;
+      await saveRules(env, currentRules);
+      result.success = false;
+      result.keyVerified = false;
+      result.error = "Unverified: upstream plaintext, keys not proven";
+      return result;
+    }
+
+    // 若上游返回密文：用提取的三元组真实 strDec，断言可解析且含 buslines
     let decryptedText = "";
     let lines = [];
     try {
-      const trimmed = (rawSmokeText || "").trim();
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        // 上游直出 JSON：使用提取的三元组进行加解密链路真实闭环断言
-        const encHex = strEnc(trimmed, extractedKeys[0], extractedKeys[1], extractedKeys[2]);
-        decryptedText = strDec(encHex, extractedKeys[0], extractedKeys[1], extractedKeys[2]);
-      } else {
-        // 上游返回加密 Hex/Ciphertext：直接执行 3DES 解密
-        decryptedText = strDec(trimmed, extractedKeys[0], extractedKeys[1], extractedKeys[2]);
-      }
-
+      decryptedText = strDec(trimmed, extractedKeys[0], extractedKeys[1], extractedKeys[2]);
       const parsed = JSON.parse(decryptedText);
       lines = parsed.buslines || [];
       if (!Array.isArray(lines) || lines.length === 0) {
-        throw new Error("Parsed lines empty");
+        throw new Error("Parsed buslines empty or not array");
       }
     } catch (cryptoErr) {
       currentRules.lastSniffStatus = "CryptoFail";
       currentRules.lastSniffTime = new Date().toISOString();
+      currentRules.keyVerified = false;
       await saveRules(env, currentRules);
       result.error = "CryptoFail: " + cryptoErr.message;
+      result.keyVerified = false;
       return result;
     }
 
     result.success = true;
+    result.keyVerified = true;
+    currentRules.keyVerified = true;
     currentRules.lastSniffStatus = `Success: Verified ${lines.length} lines on ${targetApiUrl}`;
     currentRules.lastSniffTime = new Date().toISOString();
 

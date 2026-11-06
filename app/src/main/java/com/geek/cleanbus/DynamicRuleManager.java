@@ -13,18 +13,24 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
 import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 import javax.crypto.Cipher;
-import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
@@ -53,8 +59,16 @@ public class DynamicRuleManager {
     public static final String DEFAULT_MYGOLBS_URL = "https://h5.mygolbs.com/ApiData.do";
     public static final int DEFAULT_MYGOLBS_VER = 100;
 
-    // 客户端内置签名校验密钥 (与 Worker RULES_SECRET 保持一致，不走网络)
-    public static final String RULES_SECRET = "cleanbus_dynamic_rules_hmac_sha256_key";
+    /**
+     * ECDSA P-256 (secp256r1) 规则验签公钥 (X.509 SubjectPublicKeyInfo DER Base64).
+     *
+     * 生成命令：
+     * openssl ecparam -name prime256v1 -genkey -noout -out ec_private.pem
+     * openssl pkcs8 -topk8 -nocrypt -in ec_private.pem -outform DER -out ec_private.der (Worker 环境变量 RULES_SIGNING_KEY)
+     * openssl ec -in ec_private.pem -pubout -outform DER -out ec_public.der
+     * openssl base64 -in ec_public.der -out ec_public.b64
+     */
+    public static final String PUBLIC_RULE_KEY_SPKI_B64 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfmhjeSQqCdZ0ClkF0+WCoNQm1oGefJIr9qt3LwOYztkRWrNu5oNQjYWf3Tu90Q1qAxpNhCSw4uwaeZPjvJlOGw==";
 
     // 冷却时间与连续失败计数
     private long mLastCheckTimestamp = 0;
@@ -202,9 +216,9 @@ public class DynamicRuleManager {
             return;
         }
 
-        // 规范化 JSON 并使用 Mac + MessageDigest.isEqual 常量时间校验
+        // 规范化 JSON 并使用 ECDSA P-256 (SHA256withECDSA) 验签
         String canonical = canonicalJson(toSign);
-        if (!verifyHmacSha256(canonical, RULES_SECRET, sig)) {
+        if (!verifyEcdsaSha256(canonical, sig)) {
             // 验签失败直接丢弃整包，保留内置默认规则
             return;
         }
@@ -252,8 +266,15 @@ public class DynamicRuleManager {
     }
 
     /**
-     * 域名白名单校验：host 必须属于 chelaile.net.cn, mygolbs.com, workers.dev 且协议为 https
+     * 域名精确白名单：仅允许经过严格信任审查的单一通信域名。
+     * 注释说明：以后规则要换 host 必须改这个常量并发版，这是有意的取舍。
      */
+    private static final Set<String> ALLOWED_HOSTS = new HashSet<>(Arrays.asList(
+            "cleanbus.277011444.workers.dev",
+            "h5.mygolbs.com",
+            "web.chelaile.net.cn"
+    ));
+
     static boolean isAllowedHost(String urlStr) {
         if (urlStr == null || urlStr.isEmpty()) return false;
         try {
@@ -263,17 +284,11 @@ public class DynamicRuleManager {
             }
             String host = u.getHost();
             if (host == null) return false;
-            host = host.toLowerCase();
-            return isDomainOrSubdomain(host, "chelaile.net.cn")
-                    || isDomainOrSubdomain(host, "mygolbs.com")
-                    || isDomainOrSubdomain(host, "workers.dev");
+            host = host.toLowerCase(java.util.Locale.ROOT);
+            return ALLOWED_HOSTS.contains(host);
         } catch (Exception e) {
             return false;
         }
-    }
-
-    private static boolean isDomainOrSubdomain(String host, String domain) {
-        return host.equals(domain) || host.endsWith("." + domain);
     }
 
     /**
@@ -340,24 +355,32 @@ public class DynamicRuleManager {
     }
 
     /**
-     * 常量时间校验 HMAC-SHA256
+     * ECDSA P-256 (SHA256withECDSA) 非对称签名校验
      */
-    static boolean verifyHmacSha256(String data, String secret, String expectedHex) {
+    static boolean verifyEcdsaSha256(String data, String sigB64) {
+        if (data == null || sigB64 == null || sigB64.isEmpty()) return false;
         try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec keySpec = new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
-            mac.init(keySpec);
-            byte[] hash = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hex = new StringBuilder();
-            for (byte b : hash) {
-                hex.append(String.format("%02x", b));
-            }
-            return MessageDigest.isEqual(
-                hex.toString().toLowerCase().getBytes(StandardCharsets.UTF_8),
-                expectedHex.toLowerCase().getBytes(StandardCharsets.UTF_8)
-            );
+            byte[] pubBytes = decodeBase64(PUBLIC_RULE_KEY_SPKI_B64);
+            X509EncodedKeySpec keySpec = new X509EncodedKeySpec(pubBytes);
+            KeyFactory kf = KeyFactory.getInstance("EC");
+            PublicKey pubKey = kf.generatePublic(keySpec);
+
+            Signature sig = Signature.getInstance("SHA256withECDSA");
+            sig.initVerify(pubKey);
+            sig.update(data.getBytes(StandardCharsets.UTF_8));
+
+            byte[] sigBytes = decodeBase64(sigB64);
+            return sig.verify(sigBytes);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    private static byte[] decodeBase64(String str) {
+        try {
+            return java.util.Base64.getDecoder().decode(str.trim());
+        } catch (Throwable t) {
+            return Base64.decode(str.trim(), Base64.DEFAULT);
         }
     }
 
