@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/APK%20Size-<50%20KB-brightgreen" alt="Size">
-  <img src="https://img.shields.io/badge/Android-5.0+-blue" alt="Android">
+  <img src="https://img.shields.io/badge/APK%20Size-<100%20KB-brightgreen" alt="Size">
+  <img src="https://img.shields.io/badge/Android-8.0+-blue" alt="Android">
   <img src="https://img.shields.io/badge/Dependencies-Zero-orange" alt="Dependencies">
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License">
 </p>
@@ -22,7 +22,7 @@
 市面上的实时公交 App（如车来了、掌上公交等）普遍存在体积数十上百 MB、开屏摇一摇广告泛滥、过度索取权限、启动卡顿发热等问题，且主流应用常忽视三四五线城市、边疆地州与下沉县级市的实时公交数据支持。
 
 **CleanBus** 坚持极客原则，彻底重构实时公交查询体验：
-1. **极致轻量**：仅约 **49 KB**（0.04 MB），全工程 **零第三方 SDK**、零 Jetpack 依赖、零冗余库，100% 纯原生 Android Framework Views。
+1. **极致轻量**：安装包仅数十 KB（< 100 KB），全工程 **零第三方 SDK**、零 Jetpack 依赖、零冗余库，100% 纯原生 Android Framework Views。
 2. **全国双源互补**：深度整合「车来了」与「掌上公交（MyGoLBS）」底层直连协议，覆盖一二线城市并强力打通西藏拉萨、贵州兴义/遵义/六盘水、四川宜宾等下沉市场。
 3. **极速国内直连 + 云端自愈**：日常查车默认直连国内 CDN（80ms 秒开）；配套 Cloudflare Workers 哨兵实现每 30 分钟无人值守嗅探，上游接口突发变更时客户端**免发版热更自愈**。
 4. **纯粹隐私保护**：无开屏广告、无弹窗、无后台常驻、不追踪任何用户隐私与设备 ID。
@@ -33,7 +33,7 @@
 
 ### 1. 纯原生 Java + 精准字节码控制
 - 放弃引入重量级依赖库，全套 UI 采用纯原生 Java + 原生 XML 布局手写构建。
-- 采用独立 D8 字节码优化 + AAPT2 极简打包管道，产物仅包含单个极简 `classes.dex`。
+- 采用独立 R8 字节码优化剪裁 + AAPT2 极简打包管道，产物仅包含单个极简 `classes.dex`。
 
 ### 2. 双数据源动态调度架构
 ```
@@ -103,7 +103,7 @@ clean_bus_app/
 
 ### 环境前置
 - **OpenJDK 21**
-- **Android SDK build-tools** (aapt2, d8, android.jar)
+- **Android SDK build-tools** (aapt2, r8, android.jar, uber-apk-signer)
 
 ### 执行编译
 在 PowerShell 7 中运行：
@@ -117,7 +117,7 @@ cd clean_bus_app
 
 ## 📥 下载体验
 
-预编译开箱即用 APK 位于仓库的 [releases/](releases/) 目录中，下载即可直接在 Android 5.0+ 设备上安装运行。
+预编译开箱即用 APK 可在 GitHub Releases 页面下载，直接在 Android 8.0+ (API 26+) 设备上安装运行。
 
 ---
 

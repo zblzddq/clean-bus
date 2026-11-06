@@ -4,7 +4,7 @@ bin/
 gen/
 out/
 *.apk
-!releases/*.apk
+releases/
 
 # IDE & Editor files
 .idea/
@@ -12,7 +12,10 @@ out/
 *.iml
 .vscode/
 
+# Python cache
+__pycache__/
+*.pyc
+
 # OS generated
 .DS_Store
 Thumbs.db
-
