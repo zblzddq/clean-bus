@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>纯净实时公交</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --card-bg: #161b22;
+            --border: #30363d;
+            --text: #f0f6fc;
+            --muted: #8b949e;
+            --green: #2ea043;
+            --blue: #58a6ff;
+            --tag: #21262d;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: var(--bg); color: var(--text); padding-bottom: 50px; user-select: none; }
+        .header {
+            position: sticky; top: 0; z-index: 100;
+            background: rgba(22, 27, 34, 0.95); backdrop-filter: blur(12px);
+            padding: 14px 16px; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .title { font-size: 1.15rem; font-weight: 700; color: var(--blue); display: flex; align-items: center; gap: 8px; }
+        .btn-refresh {
+            background: #238636; color: white; border: none; padding: 7px 16px;
+            border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+        }
+        .btn-refresh:active { opacity: 0.8; }
+        .statusbar {
+            padding: 10px 16px; font-size: 0.8rem; color: var(--muted);
+            background: #11161d; border-bottom: 1px solid #21262d;
+            display: flex; justify-content: space-between;
+        }
+        .container { padding: 12px 14px; max-width: 600px; margin: 0 auto; }
+        .stop-card {
+            background: var(--card-bg); border: 1px solid var(--border);
+            border-radius: 12px; margin-bottom: 14px; overflow: hidden;
+        }
+        .stop-header {
+            padding: 12px 16px; background: #1c2128; border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: baseline;
+        }
+        .stop-name { font-size: 1.05rem; font-weight: 700; color: #fff; }
+        .stop-dist { font-size: 0.8rem; color: #79c0ff; font-weight: 500; }
+        .line-item {
+            padding: 12px 16px; border-bottom: 1px solid #21262d;
+        }
+        .line-item:last-child { border-bottom: none; }
+        .line-item:active { background: #1f242c; }
+        .line-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .line-badge {
+            background: #1f6feb; color: #fff; font-size: 0.95rem; font-weight: 800;
+            padding: 2px 8px; border-radius: 6px; display: inline-block;
+        }
+        .line-dest { font-size: 0.88rem; color: #c9d1d9; font-weight: 500; margin-left: 8px; }
+        .line-time { font-size: 0.75rem; color: var(--muted); }
+        .bus-status {
+            font-size: 0.85rem; padding: 6px 10px; border-radius: 6px;
+            background: var(--tag); display: flex; align-items: center; justify-content: space-between;
+        }
+        .bus-active { color: #3fb950; font-weight: 600; }
+        .bus-idle { color: var(--muted); font-size: 0.8rem; }
+        .loading { text-align: center; padding: 40px; color: var(--muted); font-size: 0.95rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">
+            <span>🚍</span>
+            <span>纯净实时公交</span>
+        </div>
+        <button class="btn-refresh" onclick="refresh()">刷新</button>
+    </div>
+    <div class="statusbar">
+        <span id="loc-status">正在定位当前位置...</span>
+        <span id="time-status"></span>
+    </div>
+
+    <div class="container" id="content">
+        <div class="loading">正在获取周边实时公交站点...</div>
+    </div>
+
+    <script>
+        let currentLat = 29.654;
+        let currentLng = 91.118;
+        let cityId = "043"; // 拉萨
+
+        function onNativeLocation(lat, lng) {
+            currentLat = lat;
+            currentLng = lng;
+            document.getElementById('loc-status').textContent = `已获取 GPS 坐标: ${lat.toFixed(3)}, ${lng.toFixed(3)}`;
+            refresh();
+        }
+
+        function refresh() {
+            document.getElementById('time-status').textContent = new Date().toLocaleTimeString();
+            if (window.CleanBusBridge) {
+                window.CleanBusBridge.fetchNearby(String(currentLat), String(currentLng), cityId);
+            }
+        }
+
+        function onNearbyResult(jsonStr) {
+            try {
+                const data = JSON.parse(jsonStr);
+                renderStops(data.nearSts || []);
+            } catch(e) {
+                document.getElementById('content').innerHTML = `<div class="loading" style="color:#f85149;">解析失败: ${e.message}</div>`;
+            }
+        }
+
+        function onNearbyError(err) {
+            document.getElementById('content').innerHTML = `<div class="loading" style="color:#f85149;">请求失败: ${err}</div>`;
+        }
+
+        function renderStops(stops) {
+            const container = document.getElementById('content');
+            if (!stops || stops.length === 0) {
+                container.innerHTML = '<div class="loading">周边 1000 米内暂无可用公交站点</div>';
+                return;
+            }
+
+            let html = '';
+            for (const s of stops) {
+                html += `
+                <div class="stop-card">
+                    <div class="stop-header">
+                        <div class="stop-name">🚏 ${s.sn || '未知站点'}</div>
+                        <div class="stop-dist">距当前 ${s.distance ? s.distance + '米' : ''}</div>
+                    </div>
+                    <div class="line-list">`;
+                
+                const lines = s.lines || [];
+                for (const li of lines) {
+                    const info = li.line || {};
+                    const name = info.name || '';
+                    const endSn = info.endSn || '';
+                    const timeSpan = (info.firstTime && info.lastTime) ? `${info.firstTime}~${info.lastTime}` : '';
+                    const buses = li.stnStates || [];
+
+                    let busStatusHtml = '';
+                    if (buses.length > 0) {
+                        const b = buses[0];
+                        const travelM = (b.travelTime / 60).toFixed(1);
+                        const distM = b.distanceToDest ? `${b.distanceToDest}米` : '';
+                        const val = b.value !== undefined ? (b.value === 0 ? '即将进站' : `还有 ${b.value} 站`) : '';
+                        busStatusHtml = `
+                            <div class="bus-status">
+                                <span class="bus-active">📍 ${val} (约${travelM}分钟)</span>
+                                <span style="font-size:0.75rem; color:#8b949e;">距 ${distM}</span>
+                            </div>
+                        `;
+                    } else {
+                        const desc = li.preArrivalTime || info.shortDesc || '等待发车 / 暂无在途车辆';
+                        busStatusHtml = `
+                            <div class="bus-status">
+                                <span class="bus-idle">⏳ ${desc}</span>
+                            </div>
+                        `;
+                    }
+
+                    html += `
+                        <div class="line-item">
+                            <div class="line-meta">
+                                <div>
+                                    <span class="line-badge">${name}</span>
+                                    <span class="line-dest">开往 ${endSn}</span>
+                                </div>
+                                <div class="line-time">${timeSpan}</div>
+                            </div>
+                            ${busStatusHtml}
+                        </div>
+                    `;
+                }
+                html += `</div></div>`;
+            }
+            container.innerHTML = html;
+        }
+
+        window.onload = function() {
+            setTimeout(refresh, 500);
+        };
+    </script>
+</body>
+</html>
+

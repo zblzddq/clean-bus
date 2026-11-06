@@ -1,0 +1,17 @@
+# Build outputs
+build/
+bin/
+gen/
+out/
+*.apk
+!releases/*.apk
+
+# IDE & Editor files
+.idea/
+.gradle/
+*.iml
+.vscode/
+
+# OS generated
+.DS_Store
+Thumbs.db
