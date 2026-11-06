@@ -67,12 +67,14 @@ jobs:
         if: steps.fetch.outputs.ok == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: gh label create ops-alert --color FBCA04 --description "上游断供告警" 2>/dev/null || true
 
       - name: Open issues (dedupe by open ops-alert issue)
         if: steps.fetch.outputs.ok == '1' && steps.evaluate.outputs.count != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           ALERTS: ${{ steps.evaluate.outputs.alerts }}
           REPO: ${{ github.repository }}
         run: |
@@ -126,10 +128,12 @@ jobs:
         if: steps.fetch.outputs.ok == '1' && steps.evaluate.outputs.count == '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           nums=$(gh issue list --label ops-alert --state open --json number --jq '.[].number' --limit 20 || true)
           for n in $nums; do
             gh issue comment "$n" --body "本轮巡检未发现超过阈值的失败计数，若已恢复可关闭本 issue。"
           done
+
 
