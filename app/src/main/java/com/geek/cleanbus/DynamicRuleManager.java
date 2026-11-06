@@ -207,9 +207,11 @@ public class DynamicRuleManager {
         }
 
         int ruleVer = rootObj.optInt("ruleVersion", 0);
+        boolean keyVerified = rootObj.optBoolean("keyVerified", false);
         JSONObject toSign = new JSONObject();
         try {
             toSign.put("chelaile", chelaile);
+            toSign.put("keyVerified", keyVerified);
             toSign.put("mygolbs", mygolbs);
             toSign.put("ruleVersion", ruleVer);
         } catch (Exception e) {
