@@ -9,7 +9,7 @@
 // 出厂基线默认规则
 const DEFAULT_RULES = {
   ruleVersion: 2026110602,
-  keyVerified: true,
+  keyVerified: false,
   chelaile: {
     version: 101,
     baseUrl: "https://web.chelaile.net.cn/api",
@@ -55,6 +55,9 @@ async function getRules(env) {
   let merged = deepMerge(DEFAULT_RULES, inMemoryRules || {});
   if (kvRules) {
     merged = deepMerge(merged, kvRules);
+    if (kvRules.keyVerified !== true) {
+      merged.keyVerified = false;
+    }
   }
 
   inMemoryRules = merged;
@@ -104,8 +107,10 @@ export default {
         }
 
         const rules = await getRules(env);
+        const isKeyVerified = rules.keyVerified === true;
         const rulesToSign = {
           chelaile: rules.chelaile,
+          keyVerified: isKeyVerified,
           mygolbs: rules.mygolbs,
           ruleVersion: rules.ruleVersion
         };
@@ -114,17 +119,176 @@ export default {
 
         return jsonResponse({
           ...rules,
-          keyVerified: rules.keyVerified !== undefined ? rules.keyVerified : true,
+          keyVerified: isKeyVerified,
           sig
         }, 200, {
           'Cache-Control': 'public, max-age=300'
         });
       }
 
-      // 手动触发一次嗅探测试
+      // 嗅探测试端点：鉴权 + POST 限流
       if (pathname === '/api/v1/triggerSniff') {
+        if (request.method !== 'POST') {
+          return jsonResponse({ error: 'Method Not Allowed: POST required', code: 405 }, 405, {
+            'Allow': 'POST'
+          });
+        }
+
+        if (!env || !env.ADMIN_TOKEN || !verifyBearerToken(request, env.ADMIN_TOKEN)) {
+          return jsonResponse({ error: 'Unauthorized: valid Bearer token required', code: 401 }, 401);
+        }
+
+        // 5 分钟软限流 (KV)
+        const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000;
+        const rateLimitKey = 'rate_limit:trigger_sniff';
+        let lastTriggerTime = 0;
+        if (env && env.RULES_KV) {
+          try {
+            const stored = await env.RULES_KV.get(rateLimitKey);
+            if (stored) lastTriggerTime = parseInt(stored, 10) || 0;
+          } catch (e) {}
+        }
+
+        const now = Date.now();
+        if (now - lastTriggerTime < RATE_LIMIT_WINDOW_MS) {
+          const nextAvailable = new Date(lastTriggerTime + RATE_LIMIT_WINDOW_MS).toISOString();
+          const retryAfterSec = Math.max(1, Math.ceil((lastTriggerTime + RATE_LIMIT_WINDOW_MS - now) / 1000));
+          return jsonResponse({
+            error: 'Rate limit exceeded: triggerSniff allowed once every 5 minutes',
+            nextAvailable,
+            code: 429
+          }, 429, {
+            'Retry-After': retryAfterSec.toString()
+          });
+        }
+
+        if (env && env.RULES_KV) {
+          try {
+            await env.RULES_KV.put(rateLimitKey, now.toString(), { expirationTtl: 600 });
+          } catch (e) {}
+        }
+
         const result = await autoSniffAndSelfHeal(env);
-        return jsonResponse(result);
+        return jsonResponse({
+          success: result.success === true,
+          updated: result.updated === true,
+          keyVerified: result.keyVerified === true,
+          lastSniffStatus: result.lastSniffStatus || (result.error ? `Error: ${result.error}` : 'unknown')
+        });
+      }
+
+      // 运维规则人工下发与签发通道 (POST /api/v1/admin/rules)
+      if (pathname === '/api/v1/admin/rules') {
+        if (request.method !== 'POST') {
+          return jsonResponse({ error: 'Method Not Allowed: POST required', code: 405 }, 405, {
+            'Allow': 'POST'
+          });
+        }
+
+        if (!env || !env.ADMIN_TOKEN || !verifyBearerToken(request, env.ADMIN_TOKEN)) {
+          return jsonResponse({ error: 'Unauthorized: valid Bearer token required', code: 401 }, 401);
+        }
+
+        if (!env || !env.RULES_SIGNING_KEY) {
+          return jsonResponse({ error: 'RULES_SIGNING_KEY not configured', code: 503 }, 503);
+        }
+
+        let body = null;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return jsonResponse({ error: 'Invalid JSON request body', code: 400 }, 400);
+        }
+
+        if (!body || typeof body !== 'object') {
+          return jsonResponse({ error: 'Missing rule update body', code: 400 }, 400);
+        }
+
+        const ALLOWED_HOSTS = ['cleanbus.277011444.workers.dev', 'h5.mygolbs.com', 'web.chelaile.net.cn'];
+        function isHostAllowed(urlStr) {
+          if (!urlStr || typeof urlStr !== 'string') return false;
+          try {
+            const u = new URL(urlStr);
+            if (u.protocol !== 'https:') return false;
+            return ALLOWED_HOSTS.includes(u.hostname.toLowerCase());
+          } catch (e) {
+            return false;
+          }
+        }
+
+        const currentRules = await getRules(env);
+
+        if (body.chelaile) {
+          const c = body.chelaile;
+          if (c.baseUrl && !isHostAllowed(c.baseUrl)) {
+            return jsonResponse({ error: `Disallowed host or non-HTTPS URL for chelaile: ${c.baseUrl}`, code: 400 }, 400);
+          }
+          if (c.version !== undefined && Number(c.version) <= (currentRules.chelaile.version || 0)) {
+            return jsonResponse({
+              error: `chelaile.version (${c.version}) must be strictly greater than current version (${currentRules.chelaile.version})`,
+              code: 400
+            }, 400);
+          }
+        }
+
+        if (body.mygolbs) {
+          const m = body.mygolbs;
+          if (m.url && !isHostAllowed(m.url)) {
+            return jsonResponse({ error: `Disallowed host or non-HTTPS URL for mygolbs: ${m.url}`, code: 400 }, 400);
+          }
+          if (m.version !== undefined && Number(m.version) <= (currentRules.mygolbs.version || 0)) {
+            return jsonResponse({
+              error: `mygolbs.version (${m.version}) must be strictly greater than current version (${currentRules.mygolbs.version})`,
+              code: 400
+            }, 400);
+          }
+        }
+
+        const newRuleVersion = (currentRules.ruleVersion || 2026110600) + 1;
+        const newRules = {
+          ...currentRules,
+          ruleVersion: newRuleVersion,
+          keyVerified: true,
+          lastSniffTime: new Date().toISOString(),
+          lastSniffStatus: `Admin update: ${body.chelaile ? `chelaile v${body.chelaile.version || 'patch'}` : ''} ${body.mygolbs ? `mygolbs v${body.mygolbs.version || 'patch'}` : ''}`.trim()
+        };
+
+        if (body.chelaile) {
+          newRules.chelaile = {
+            ...currentRules.chelaile,
+            ...body.chelaile,
+            status: 'verified'
+          };
+        }
+        if (body.mygolbs) {
+          newRules.mygolbs = {
+            ...currentRules.mygolbs,
+            ...body.mygolbs,
+            status: 'verified'
+          };
+        }
+
+        await saveRules(env, newRules);
+
+        const rulesToSign = {
+          chelaile: newRules.chelaile,
+          keyVerified: true,
+          mygolbs: newRules.mygolbs,
+          ruleVersion: newRules.ruleVersion
+        };
+        const canonical = canonicalJson(rulesToSign);
+        const sig = await signEcdsaP256DerB64(canonical, env.RULES_SIGNING_KEY);
+
+        return jsonResponse({
+          code: 0,
+          message: 'Admin rule update signed and published successfully',
+          ruleVersion: newRules.ruleVersion,
+          sig,
+          rules: {
+            ...newRules,
+            sig
+          }
+        }, 200);
       }
 
       // 2. 线路搜索代理
@@ -168,6 +332,14 @@ export default {
     ctx.waitUntil(autoSniffAndSelfHeal(env));
   }
 };
+
+function verifyBearerToken(request, expectedToken) {
+  if (!expectedToken || typeof expectedToken !== 'string') return false;
+  const authHeader = request.headers.get('Authorization') || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return false;
+  return match[1].trim() === expectedToken.trim();
+}
 
 function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -359,6 +531,7 @@ async function autoSniffAndSelfHeal(env) {
       currentRules.keyVerified = false;
       await saveRules(env, currentRules);
       result.error = "CryptoFail: " + cryptoErr.message;
+      result.lastSniffStatus = currentRules.lastSniffStatus;
       result.keyVerified = false;
       return result;
     }
@@ -367,6 +540,7 @@ async function autoSniffAndSelfHeal(env) {
     result.keyVerified = true;
     currentRules.keyVerified = true;
     currentRules.lastSniffStatus = `Success: Verified ${lines.length} lines on ${targetApiUrl}`;
+    result.lastSniffStatus = currentRules.lastSniffStatus;
     currentRules.lastSniffTime = new Date().toISOString();
 
     // 6. 版本指纹机制 (P0-4：对 {chelaile, mygolbs} 规范化 JSON 计算 SHA-256)
